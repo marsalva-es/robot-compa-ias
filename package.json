@@ -1,0 +1,16 @@
+{
+  "name": "robot-homeserve",
+  "version": "1.0.0",
+  "description": "Bot para sincronizar HomeServe con Firebase",
+  "main": "robot.js",
+  "scripts": {
+    "start": "node robot.js"
+  },
+  "dependencies": {
+    "firebase-admin": "^11.11.0",
+    "playwright": "^1.40.0"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}
