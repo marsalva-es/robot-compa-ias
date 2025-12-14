@@ -1,7 +1,7 @@
 const { chromium } = require('playwright');
 const admin = require('firebase-admin');
 
-// --- 1. CONFIGURACIÓN FIREBASE ---
+// --- CONFIGURACIÓN FIREBASE ---
 if (process.env.FIREBASE_PRIVATE_KEY) {
   try {
     admin.initializeApp({
@@ -23,16 +23,13 @@ if (process.env.FIREBASE_PRIVATE_KEY) {
 const db = admin.firestore();
 const COLLECTION_NAME = "appointments";
 
-// --- FUNCIÓN PRINCIPAL ---
 async function runRobot() {
-  // FÍJATE AQUÍ: He cambiado el nombre a V3.1 para que lo reconozcas en el Log
-  console.log('🤖 [V3.1] Arrancando robot HomeServe (Versión CODIGO)...');
+  console.log('🤖 [V3.2] Arrancando robot HomeServe (Modo Tecleo Humano)...');
   
   const browser = await chromium.launch({ 
     headless: true,
     args: ['--no-sandbox', '--disable-setuid-sandbox'] 
   }); 
-  
   const context = await browser.newContext();
   const page = await context.newPage();
 
@@ -41,38 +38,57 @@ async function runRobot() {
     console.log('🔐 Entrando al login...');
     await page.goto('https://www.clientes.homeserve.es/cgi-bin/fccgi.exe?w3exec=PROF_PASS', { timeout: 60000 });
 
-    // --- CORRECCIÓN DE TU FOTO ---
-    // En tu foto se ve claro: name="CODIGO"
     const selectorUsuario = 'input[name="CODIGO"]';
     const selectorPass = 'input[type="password"]';
 
     if (await page.isVisible(selectorUsuario)) {
-        console.log("📝 He visto la casilla 'CODIGO'. Rellenando...");
-        await page.fill(selectorUsuario, process.env.HOMESERVE_USER || ''); 
-        await page.fill(selectorPass, process.env.HOMESERVE_PASS || '');
+        console.log("📝 Escribiendo credenciales lentamente (como un humano)...");
         
-        console.log('👆 Pulsando botón Aceptar...');
-        await Promise.all([
-          page.waitForNavigation({ timeout: 30000 }), 
-          page.click('input[type="submit"], input[value="Aceptar"]')
-        ]);
+        // TRUCO 1: Escribir con retardo (delay) para engañar al filtro 'FILTRA(event)'
+        // Escribe el usuario
+        await page.type(selectorUsuario, process.env.HOMESERVE_USER || '', { delay: 150 }); 
+        
+        // Escribe la contraseña
+        await page.type(selectorPass, process.env.HOMESERVE_PASS || '', { delay: 150 });
+        
+        console.log('👆 Pulsando tecla ENTER...');
+        // TRUCO 2: Pulsar Enter suele ser más seguro que buscar el botón en webs antiguas
+        await page.keyboard.press('Enter');
+
+        // Esperamos a que la página reaccione
+        await page.waitForNavigation({ timeout: 30000, waitUntil: 'domcontentloaded' });
+        
     } else {
-        console.log("⚠️ Sigo sin ver la casilla 'CODIGO'. Imprimiendo HTML para investigar:");
-        // Si falla, imprimimos el HTML para ver qué está pasando
-        console.log((await page.content()).substring(0, 1000));
+        console.log("⚠️ No veo la casilla CODIGO.");
     }
 
-    // --- PASO 2: COMPROBAR LOGIN ---
-    if (page.url().includes('PROF_PASS')) {
-        console.error("⛔ EL LOGIN HA FALLADO. El robot sigue en la página de inicio.");
-        throw new Error("Login fallido");
+    // --- PASO 2: VERIFICACIÓN ---
+    // Si seguimos en la URL de login (PROF_PASS) o vemos el mensaje de error
+    const currentUrl = page.url();
+    if (currentUrl.includes('PROF_PASS')) {
+        console.error("⛔ LOGIN FALLIDO: La web nos ha devuelto al inicio.");
+        
+        // Intentamos leer el mensaje de error rojo de la web
+        const errorEnPantalla = await page.evaluate(() => {
+            return document.body.innerText;
+        });
+
+        if (errorEnPantalla.includes("incorrecto") || errorEnPantalla.includes("inexistente")) {
+            console.error("👉 LA WEB DICE: Usuario o contraseña incorrectos.");
+        } else {
+            console.error("👉 TEXTO EN PANTALLA (Primeras lineas):");
+            console.error(errorEnPantalla.substring(0, 200));
+        }
+        throw new Error("No pudimos pasar del login.");
     }
 
-    // --- PASO 3: IR A LA LISTA ---
-    console.log('📂 Login OK. Yendo a servicios...');
-    await page.goto('https://www.clientes.homeserve.es/cgi-bin/fccgi.exe?w3exec=lista_servicios_total');
-    
-    // --- PASO 4: LEER DATOS ---
+    // --- PASO 3: EXTRACCIÓN ---
+    console.log('📂 ¡Estamos dentro! Leyendo servicios...');
+    // Aseguramos estar en la lista total
+    if (!currentUrl.includes('lista_servicios_total')) {
+        await page.goto('https://www.clientes.homeserve.es/cgi-bin/fccgi.exe?w3exec=lista_servicios_total');
+    }
+
     const servicios = await page.evaluate(() => {
       const filas = Array.from(document.querySelectorAll('table tr'));
       const datos = [];
@@ -95,9 +111,9 @@ async function runRobot() {
       return datos;
     });
 
-    console.log(`📦 ¡BINGO! Encontrados: ${servicios.length} servicios.`);
+    console.log(`📦 Encontrados: ${servicios.length} servicios.`);
 
-    // --- PASO 5: GUARDAR ---
+    // --- PASO 4: GUARDADO ---
     for (const s of servicios) {
       const docRef = db.collection(COLLECTION_NAME).doc(s.serviceNumber);
       const doc = await docRef.get();
@@ -109,9 +125,10 @@ async function runRobot() {
 
   } catch (error) {
     console.error('❌ ERROR:', error.message);
+    process.exit(1);
   } finally {
     await browser.close();
-    console.log('🏁 Fin V3.1');
+    console.log('🏁 Fin V3.2');
     process.exit(0);
   }
 }
