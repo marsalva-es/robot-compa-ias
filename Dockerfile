@@ -1,14 +1,12 @@
-# Usamos una imagen de Microsoft que YA TIENE los navegadores y dependencias instalados
-FROM mcr.microsoft.com/playwright:v1.40.0-jammy
+# ACTUALIZADO A LA VERSIÓN QUE PIDE EL ERROR (1.57.0)
+FROM mcr.microsoft.com/playwright:v1.57.0-jammy
 
-# Creamos la carpeta de trabajo
 WORKDIR /app
 
-# Copiamos tus archivos al contenedor
 COPY package.json robot.js ./
 
-# Instalamos las librerías de Node
+# Instalamos dependencias
 RUN npm install
 
-# Comando para arrancar el robot
+# Arrancamos el robot
 CMD ["node", "robot.js"]
