@@ -1,112 +1,60 @@
 const { chromium } = require('playwright');
-const admin = require('firebase-admin');
 
-// --- CONFIGURACIÓN DE FIREBASE ---
-if (process.env.FIREBASE_PRIVATE_KEY) {
-  try {
-    admin.initializeApp({
-      credential: admin.credential.cert({
-        projectId: process.env.FIREBASE_PROJECT_ID,
-        clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-        privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
-      })
-    });
-  } catch (err) {
-    console.error("❌ Error inicializando Firebase:", err.message);
-    process.exit(1);
-  }
-} else {
-  console.error("⚠️ FALTAN LAS CLAVES DE FIREBASE");
-  process.exit(1);
-}
-
-const db = admin.firestore();
-const COLLECTION_NAME = "appointments";
-
-// --- FUNCIÓN PRINCIPAL ---
-async function iniciarRobot() {
-  console.log('🤖 [V2.0] Arrancando robot HomeServe...');
+async function modoDetective() {
+  console.log('🕵️‍♂️ [MODO DETECTIVE] Iniciando investigación...');
   
-  // En Docker, Playwright necesita estos argumentos para no fallar
+  // Lanzamos con opciones para evitar bloqueos
   const browser = await chromium.launch({ 
     headless: true,
     args: ['--no-sandbox', '--disable-setuid-sandbox'] 
   }); 
-  
-  const context = await browser.newContext();
-  const page = await context.newPage();
+  const page = await browser.newPage();
 
   try {
-    // 1. LOGIN
-    console.log('🔐 Entrando al login...');
+    console.log('🌍 Visitando la página de login...');
+    // A veces HomeServe redirige, esperamos un poco
     await page.goto('https://www.clientes.homeserve.es/cgi-bin/fccgi.exe?w3exec=PROF_PASS', { timeout: 60000 });
+    await page.waitForTimeout(3000); // Espera 3 seg a que cargue todo
 
-    const userSelector = 'input[name="Usuario"]';
-    const passSelector = 'input[name="Password"]';
-    
-    // Verificamos si existen los campos
-    if (await page.isVisible(userSelector)) {
-        await page.fill(userSelector, process.env.HOMESERVE_USER || ''); 
-        await page.fill(passSelector, process.env.HOMESERVE_PASS || '');
-        
-        console.log('👆 Pulsando botón de entrar...');
-        await Promise.all([
-          page.waitForNavigation({ timeout: 30000 }), 
-          page.click('input[type="submit"], button[type="submit"]')
-        ]);
-    } else {
-        console.log("⚠️ No veo el formulario de login. ¿Quizás ya estamos dentro?");
-    }
+    // 1. DIME EL TÍTULO (Para saber si cargó bien)
+    const titulo = await page.title();
+    console.log(`📑 Título de la página: "${titulo}"`);
 
-    // 2. IR A LA LISTA
-    console.log('📂 Yendo a lista de servicios...');
-    const response = await page.goto('https://www.clientes.homeserve.es/cgi-bin/fccgi.exe?w3exec=lista_servicios_total');
-    
-    if (!response.ok()) throw new Error("La web de HomeServe no carga.");
-
-    // 3. LEER DATOS
-    const servicios = await page.evaluate(() => {
-      const filas = Array.from(document.querySelectorAll('table tr'));
-      const datos = [];
-      filas.forEach(tr => {
-        const tds = tr.querySelectorAll('td');
-        if (tds.length > 5) {
-            let ref = tds[0]?.innerText?.trim();
-            if (ref && !isNaN(ref) && ref.length > 3) { 
-                datos.push({
-                    serviceNumber: ref,
-                    clientName: tds[2]?.innerText?.trim(),
-                    address: tds[3]?.innerText?.trim(),
-                    phone: tds[4]?.innerText?.trim(),
-                    status: "pendingStart",
-                    createdAt: new Date().toISOString()
-                });
-            }
-        }
-      });
-      return datos;
+    // 2. BUSCAR TODOS LOS INPUTS (Cajas de texto)
+    // El robot nos dirá qué 'name' o 'id' tienen las cajas que ve.
+    const inputs = await page.evaluate(() => {
+        const campos = Array.from(document.querySelectorAll('input'));
+        return campos.map(c => ({
+            tipo: c.type,
+            name: c.name,
+            id: c.id,
+            placeholder: c.placeholder,
+            visible: c.offsetParent !== null // Truco para saber si se ve
+        }));
     });
 
-    console.log(`📦 Encontrados: ${servicios.length} servicios.`);
-
-    // 4. GUARDAR
-    for (const s of servicios) {
-      const docRef = db.collection(COLLECTION_NAME).doc(s.serviceNumber);
-      const doc = await docRef.get();
-      if (!doc.exists) {
-        await docRef.set(s);
-        console.log(`➕ Guardado: ${s.serviceNumber}`);
-      }
+    console.log('🔎 HE ENCONTRADO ESTOS CAMPOS EN LA WEB:');
+    console.log('------------------------------------------------');
+    if (inputs.length === 0) {
+        console.log("❌ ¡SOCORRO! No veo ningún campo (input). ¿Quizás hay un 'frame' o la web está en blanco?");
+        // Si no hay inputs, imprimimos el HTML para ver qué pasa
+        const html = await page.content();
+        console.log("--- HTML DE LA PÁGINA (Primeros 500 caracteres) ---");
+        console.log(html.substring(0, 500));
+    } else {
+        inputs.forEach(input => {
+            console.log(`➡️  Tipo: [${input.tipo}] | Name: "${input.name}" | ID: "${input.id}" | Visible: ${input.visible}`);
+        });
     }
+    console.log('------------------------------------------------');
+    console.log('💡 USA EL "NAME" O "ID" QUE VEAS ARRIBA PARA CORREGIR TU ROBOT REAL.');
 
   } catch (error) {
-    console.error('❌ ERROR:', error.message);
+    console.error('❌ Error del detective:', error.message);
   } finally {
     await browser.close();
-    console.log('🏁 Fin.');
     process.exit(0);
   }
 }
 
-// ⚠️ LLAMADA A LA FUNCIÓN NUEVA
-iniciarRobot();
+modoDetective();
