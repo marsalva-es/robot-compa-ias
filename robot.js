@@ -25,7 +25,8 @@ const COLLECTION_NAME = "appointments";
 
 // --- FUNCIÓN PRINCIPAL ---
 async function runRobot() {
-  console.log('🤖 [V3.0] Arrancando robot HomeServe (Versión Corregida)...');
+  // FÍJATE AQUÍ: He cambiado el nombre a V3.1 para que lo reconozcas en el Log
+  console.log('🤖 [V3.1] Arrancando robot HomeServe (Versión CODIGO)...');
   
   const browser = await chromium.launch({ 
     headless: true,
@@ -40,39 +41,35 @@ async function runRobot() {
     console.log('🔐 Entrando al login...');
     await page.goto('https://www.clientes.homeserve.es/cgi-bin/fccgi.exe?w3exec=PROF_PASS', { timeout: 60000 });
 
-    // ⚠️ AQUÍ ESTÁ LA CORRECCIÓN BASADA EN TU FOTO ⚠️
-    // Tu foto dice que el usuario es 'CODIGO'.
-    // Para la contraseña usamos 'type=password' que es infalible.
+    // --- CORRECCIÓN DE TU FOTO ---
+    // En tu foto se ve claro: name="CODIGO"
     const selectorUsuario = 'input[name="CODIGO"]';
     const selectorPass = 'input[type="password"]';
 
     if (await page.isVisible(selectorUsuario)) {
-        console.log("📝 Rellenando credenciales...");
+        console.log("📝 He visto la casilla 'CODIGO'. Rellenando...");
         await page.fill(selectorUsuario, process.env.HOMESERVE_USER || ''); 
         await page.fill(selectorPass, process.env.HOMESERVE_PASS || '');
         
-        console.log('👆 Pulsando botón "Aceptar"...');
+        console.log('👆 Pulsando botón Aceptar...');
         await Promise.all([
           page.waitForNavigation({ timeout: 30000 }), 
-          // Buscamos el botón por el texto "Aceptar" o por ser input submit
           page.click('input[type="submit"], input[value="Aceptar"]')
         ]);
     } else {
-        console.log("⚠️ No veo la casilla CODIGO. ¿Quizás ya estamos dentro?");
+        console.log("⚠️ Sigo sin ver la casilla 'CODIGO'. Imprimiendo HTML para investigar:");
+        // Si falla, imprimimos el HTML para ver qué está pasando
+        console.log((await page.content()).substring(0, 1000));
     }
 
-    // --- PASO 2: VERIFICAR SI ENTRAMOS ---
-    // Si la URL sigue teniendo 'PROF_PASS', es que el login falló
+    // --- PASO 2: COMPROBAR LOGIN ---
     if (page.url().includes('PROF_PASS')) {
-        console.error("⛔ LOGIN FALLIDO. Revisa que tu Usuario y Contraseña en Render sean correctos.");
-        // Imprimimos el texto de error de la web si lo hay
-        const errorText = await page.innerText('body'); 
-        if(errorText.includes("incorrecto")) console.error("La web dice: Usuario o clave incorrectos.");
-        throw new Error("No se pudo iniciar sesión.");
+        console.error("⛔ EL LOGIN HA FALLADO. El robot sigue en la página de inicio.");
+        throw new Error("Login fallido");
     }
 
     // --- PASO 3: IR A LA LISTA ---
-    console.log('📂 Navegando a lista de servicios...');
+    console.log('📂 Login OK. Yendo a servicios...');
     await page.goto('https://www.clientes.homeserve.es/cgi-bin/fccgi.exe?w3exec=lista_servicios_total');
     
     // --- PASO 4: LEER DATOS ---
@@ -81,10 +78,8 @@ async function runRobot() {
       const datos = [];
       filas.forEach(tr => {
         const tds = tr.querySelectorAll('td');
-        // Filtramos filas que tengan datos
         if (tds.length > 5) {
             let ref = tds[0]?.innerText?.trim();
-            // Comprobamos que sea un número de referencia válido
             if (ref && !isNaN(ref) && ref.length > 3) { 
                 datos.push({
                     serviceNumber: ref,
@@ -100,28 +95,23 @@ async function runRobot() {
       return datos;
     });
 
-    console.log(`📦 Encontrados: ${servicios.length} servicios.`);
+    console.log(`📦 ¡BINGO! Encontrados: ${servicios.length} servicios.`);
 
-    // --- PASO 5: GUARDAR EN FIREBASE ---
-    let nuevos = 0;
+    // --- PASO 5: GUARDAR ---
     for (const s of servicios) {
       const docRef = db.collection(COLLECTION_NAME).doc(s.serviceNumber);
       const doc = await docRef.get();
       if (!doc.exists) {
         await docRef.set(s);
-        console.log(`➕ Guardado nuevo servicio: ${s.serviceNumber}`);
-        nuevos++;
+        console.log(`➕ Guardado: ${s.serviceNumber}`);
       }
     }
-    
-    if (nuevos === 0) console.log("💤 No hay servicios nuevos.");
 
   } catch (error) {
     console.error('❌ ERROR:', error.message);
-    process.exit(1);
   } finally {
     await browser.close();
-    console.log('🏁 Fin.');
+    console.log('🏁 Fin V3.1');
     process.exit(0);
   }
 }
