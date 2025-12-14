@@ -1,238 +1,312 @@
-const { chromium } = require('playwright');
-const admin = require('firebase-admin');
+// server.js
+const express = require("express");
+const cors = require("cors");
+const crypto = require("crypto");
+const admin = require("firebase-admin");
 
-// =========================
-// 1) FIREBASE ADMIN INIT
-// =========================
-if (process.env.FIREBASE_PRIVATE_KEY) {
-  try {
-    admin.initializeApp({
-      credential: admin.credential.cert({
-        projectId: process.env.FIREBASE_PROJECT_ID,
-        clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-        privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
-      }),
-    });
-  } catch (err) {
-    console.error("❌ Error inicializando Firebase:", err.message);
+// ================== FIREBASE ADMIN INIT (Render env) ==================
+if (!admin.apps.length) {
+  const projectId = process.env.FIREBASE_PROJECT_ID;
+  const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
+  const privateKey = (process.env.FIREBASE_PRIVATE_KEY || "").replace(/\\n/g, "\n");
+
+  if (!projectId || !clientEmail || !privateKey) {
+    console.error("❌ Faltan credenciales FIREBASE_* en environment.");
     process.exit(1);
   }
-} else {
-  console.error("⚠️ FALTAN LAS CLAVES DE FIREBASE");
-  process.exit(1);
+
+  admin.initializeApp({
+    credential: admin.credential.cert({ projectId, clientEmail, privateKey }),
+  });
 }
 
 const db = admin.firestore();
 
-// =========================
-// 2) CONFIG
-// =========================
-const COLLECTION_NAME = "homeserve_pendientes";
+// ================== APP ==================
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: "1mb" }));
 
-// ✅ Aquí es donde la web guardará credenciales por proveedor
-// Firestore: providerConfigs/homeserve { user, pass }
+app.get("/health", (req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
+
+// ================== AUTH MIDDLEWARE ==================
+async function requireAuth(req, res, next) {
+  try {
+    const h = req.headers.authorization || "";
+    const m = h.match(/^Bearer (.+)$/i);
+    if (!m) return res.status(401).json({ error: "Missing Bearer token" });
+
+    const decoded = await admin.auth().verifyIdToken(m[1], true);
+    req.user = decoded;
+    next();
+  } catch (e) {
+    return res.status(401).json({ error: "Invalid token" });
+  }
+}
+
+// (Opcional) restringir a admins
+function requireAdmin(req, res, next) {
+  // Si no pones ADMIN_EMAILS, deja pasar a cualquier usuario autenticado.
+  const allow = (process.env.ADMIN_EMAILS || "").split(",").map(s => s.trim()).filter(Boolean);
+  if (allow.length === 0) return next();
+
+  const email = (req.user && req.user.email) ? String(req.user.email).toLowerCase() : "";
+  const ok = allow.map(e => e.toLowerCase()).includes(email);
+  if (!ok) return res.status(403).json({ error: "No admin" });
+  next();
+}
+
+// ================== ENCRYPTION HELPERS (Provider passwords) ==================
+/**
+ * Set in Render:
+ * PROVIDER_CRED_SECRET = 32+ chars random (best: 64 hex)
+ */
+function getKey() {
+  const secret = process.env.PROVIDER_CRED_SECRET || "";
+  if (secret.length < 32) {
+    throw new Error("Missing/weak PROVIDER_CRED_SECRET (min 32 chars).");
+  }
+  // Derive 32-byte key from secret
+  return crypto.createHash("sha256").update(secret, "utf8").digest(); // 32 bytes
+}
+
+function encryptText(plain) {
+  const key = getKey();
+  const iv = crypto.randomBytes(12); // GCM 12 bytes
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+  const enc = Buffer.concat([cipher.update(String(plain), "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return {
+    passEnc: enc.toString("base64"),
+    passIv: iv.toString("base64"),
+    passTag: tag.toString("base64"),
+  };
+}
+
+function decryptText({ passEnc, passIv, passTag }) {
+  const key = getKey();
+  if (!passEnc || !passIv || !passTag) return null;
+
+  const iv = Buffer.from(passIv, "base64");
+  const tag = Buffer.from(passTag, "base64");
+  const data = Buffer.from(passEnc, "base64");
+
+  const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
+  decipher.setAuthTag(tag);
+  const dec = Buffer.concat([decipher.update(data), decipher.final()]);
+  return dec.toString("utf8");
+}
+
+// ================== PROVIDER MAP ==================
+const PROVIDERS = {
+  homeserve: {
+    pendingCollection: "homeserve_pendientes",
+    label: "HomeServe",
+  },
+  multiasistencia: {
+    pendingCollection: "multiasistencia_pendientes", // preparado
+    label: "Multiasistencia",
+  },
+  todo: {
+    pendingCollection: "todo_pendientes", // preparado
+    label: "To&Do",
+  },
+};
+
+function getProviderOrThrow(provider) {
+  const p = PROVIDERS[String(provider || "").toLowerCase()];
+  if (!p) throw new Error("Provider not supported");
+  return p;
+}
+
+// ================== PROVIDER CONFIG (Firestore) ==================
+/**
+ * Firestore:
+ * collection: providerConfigs
+ * doc id: homeserve | multiasistencia | todo
+ *
+ * fields:
+ * - user: string
+ * - passEnc/passIv/passTag: string (encrypted)
+ * - updatedAt: serverTimestamp
+ */
 const PROVIDER_CONFIG_COLLECTION = "providerConfigs";
-const PROVIDER_ID = "homeserve";
 
-// =========================
-// 3) HELPERS
-// =========================
-async function loadProviderCredentials(providerId) {
+// GET provider config (no devuelve pass)
+app.get("/admin/provider/:provider", requireAuth, requireAdmin, async (req, res) => {
   try {
-    const snap = await db.collection(PROVIDER_CONFIG_COLLECTION).doc(providerId).get();
-    if (!snap.exists) {
-      console.log(`⚠️ No existe config en Firestore: ${PROVIDER_CONFIG_COLLECTION}/${providerId}`);
-      return null;
-    }
+    const provider = String(req.params.provider).toLowerCase();
+    getProviderOrThrow(provider);
 
-    const data = snap.data() || {};
-    const user = (data.user || "").trim();
-    const pass = (data.pass || "").trim();
+    const snap = await db.collection(PROVIDER_CONFIG_COLLECTION).doc(provider).get();
+    if (!snap.exists) return res.json({ user: "", hasPass: false });
 
-    if (!user || !pass) {
-      console.log(`⚠️ Config incompleta en Firestore: falta user/pass en ${PROVIDER_CONFIG_COLLECTION}/${providerId}`);
-      return null;
-    }
-
-    console.log(`✅ Credenciales cargadas desde Firestore (${PROVIDER_CONFIG_COLLECTION}/${providerId}) user="${user}" pass="***"`);
-    return { user, pass };
-  } catch (err) {
-    console.error("❌ Error leyendo credenciales de Firestore:", err.message);
-    return null;
+    const d = snap.data() || {};
+    return res.json({
+      user: d.user || "",
+      hasPass: !!(d.passEnc && d.passIv && d.passTag),
+      updatedAt: d.updatedAt || null,
+    });
+  } catch (e) {
+    return res.status(400).json({ error: e.message || "Error" });
   }
-}
+});
 
-function nowIso() {
-  return new Date().toISOString();
-}
-
-// =========================
-// 4) ROBOT
-// =========================
-async function runRobot() {
-  console.log('🤖 [V6.3] Arrancando robot (Credenciales desde Firestore + Limpieza Teléfono)...');
-
-  // ✅ Cargar credenciales desde Firestore
-  const creds = await loadProviderCredentials(PROVIDER_ID);
-
-  // Fallback a env si Firestore no tiene nada (por si acaso)
-  const HS_USER = creds?.user || (process.env.HOMESERVE_USER || "");
-  const HS_PASS = creds?.pass || (process.env.HOMESERVE_PASS || "");
-
-  if (!HS_USER || !HS_PASS) {
-    console.error("❌ No hay credenciales de HomeServe. (Ni en Firestore ni en ENV).");
-    process.exit(1);
-  }
-
-  const browser = await chromium.launch({
-    headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox']
-  });
-
-  const context = await browser.newContext();
-  const page = await context.newPage();
-
+// POST provider config
+// body: { user: string, pass: string|null }  (pass=null => no cambiar pass)
+app.post("/admin/provider/:provider", requireAuth, requireAdmin, async (req, res) => {
   try {
-    // --- PASO 1: LOGIN ---
-    console.log('🔐 Entrando al login...');
-    await page.goto('https://www.clientes.homeserve.es/cgi-bin/fccgi.exe?w3exec=PROF_PASS', { timeout: 60000 });
+    const provider = String(req.params.provider).toLowerCase();
+    getProviderOrThrow(provider);
 
-    const selectorUsuario = 'input[name="CODIGO"]';
-    const selectorPass = 'input[type="password"]';
+    const user = String(req.body.user || "").trim();
+    const pass = req.body.pass; // string or null
 
-    if (await page.isVisible(selectorUsuario)) {
-      // Limpia por si el navegador autocompleta basura
-      await page.fill(selectorUsuario, "");
-      await page.fill(selectorPass, "");
+    if (!user) return res.status(400).json({ error: "Missing user" });
 
-      // Escribe credenciales
-      await page.type(selectorUsuario, HS_USER, { delay: 60 });
-      await page.type(selectorPass, HS_PASS, { delay: 60 });
+    const ref = db.collection(PROVIDER_CONFIG_COLLECTION).doc(provider);
 
-      console.log('👆 Pulsando ENTER...');
-      await page.keyboard.press('Enter');
-      await page.waitForTimeout(5000);
-    } else {
-      console.log("ℹ️ No veo el formulario de login (puede que ya esté logueado o haya cambiado la pantalla).");
+    const payload = {
+      user,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+
+    if (typeof pass === "string" && pass.trim()) {
+      Object.assign(payload, encryptText(pass.trim()));
     }
 
-    // --- PASO 2: OBTENER LISTA ---
-    console.log('📂 Leyendo lista de servicios...');
-    await page.goto('https://www.clientes.homeserve.es/cgi-bin/fccgi.exe?w3exec=lista_servicios_total', { timeout: 60000 });
+    await ref.set(payload, { merge: true });
+    return res.json({ success: true });
+  } catch (e) {
+    return res.status(400).json({ error: e.message || "Error" });
+  }
+});
 
-    const referenciasEnWeb = await page.evaluate(() => {
-      const filas = Array.from(document.querySelectorAll('table tr'));
-      const refs = [];
-      filas.forEach(tr => {
-        const tds = tr.querySelectorAll('td');
-        if (tds.length > 5) {
-          let ref = tds[0]?.innerText?.trim();
-          if (ref && !isNaN(ref.replace(/\D/g, '')) && ref.length > 3) {
-            refs.push(ref);
-          }
-        }
-      });
-      return refs;
+// ================== SERVICES (Pendientes) ==================
+
+// List pending services
+app.get("/admin/services/:provider", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const provider = String(req.params.provider).toLowerCase();
+    const p = getProviderOrThrow(provider);
+
+    const snap = await db.collection(p.pendingCollection)
+      .orderBy("updatedAt", "desc")
+      .limit(300)
+      .get();
+
+    const out = snap.docs.map(doc => {
+      const d = doc.data() || {};
+      return {
+        id: doc.id,
+        client: d.clientName || "",
+        address: d.address || "",
+        phone: d.phone || "",
+        serviceNumber: d.serviceNumber || doc.id,
+        company: d.company || "",
+        providerStatus: d.homeserveStatus || d.providerStatus || "",
+        status: d.status || "",
+        updatedAt: d.updatedAt || null,
+        createdAt: d.createdAt || null,
+        dateString: d.dateString || "",
+        description: d.description || "",
+      };
     });
 
-    console.log(`🔎 Encontrados ${referenciasEnWeb.length} servicios.`);
+    return res.json(out);
+  } catch (e) {
+    return res.status(400).json({ error: e.message || "Error" });
+  }
+});
 
-    // --- PASO 3: PROCESAR UNO A UNO ---
-    let actualizados = 0;
-    let nuevos = 0;
+// Delete pending services
+app.post("/admin/services/:provider/delete", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const provider = String(req.params.provider).toLowerCase();
+    const p = getProviderOrThrow(provider);
 
-    for (const ref of referenciasEnWeb) {
+    const ids = Array.isArray(req.body.ids) ? req.body.ids.map(String) : [];
+    if (!ids.length) return res.status(400).json({ error: "ids[] required" });
 
-      const docRef = db.collection(COLLECTION_NAME).doc(ref);
-      const docSnapshot = await docRef.get();
-      const datosAntiguos = docSnapshot.exists ? docSnapshot.data() : null;
+    const batch = db.batch();
+    ids.forEach(id => {
+      batch.delete(db.collection(p.pendingCollection).doc(id));
+    });
+    await batch.commit();
 
-      // Navegar a la lista y hacer click (refrescar sesión y datos)
-      await page.goto('https://www.clientes.homeserve.es/cgi-bin/fccgi.exe?w3exec=lista_servicios_total', { timeout: 60000 });
-      try {
-        await page.click(`text="${ref}"`);
-        await page.waitForTimeout(1500);
-      } catch (e) {
-        console.error(`⚠️ No pude entrar en ficha ${ref}.`);
-        continue;
-      }
+    return res.json({ success: true, deleted: ids.length });
+  } catch (e) {
+    return res.status(400).json({ error: e.message || "Error" });
+  }
+});
 
-      // --- SCRAPING CON LIMPIEZA DE TELÉFONO ---
-      const detalles = await page.evaluate(() => {
-        const d = {};
-        const filas = Array.from(document.querySelectorAll('tr'));
-        filas.forEach(tr => {
-          const celdas = tr.querySelectorAll('td');
-          if (celdas.length >= 2) {
-            const clave = celdas[0].innerText.toUpperCase().trim();
-            const valor = celdas[1].innerText.trim();
+// Move to appointments
+app.post("/admin/services/:provider/to-appointments", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const provider = String(req.params.provider).toLowerCase();
+    const p = getProviderOrThrow(provider);
 
-            if (clave.includes("TELEFONOS")) {
-              const match = valor.match(/[6789]\d{8}/);
-              d.phone = match ? match[0] : valor;
-            }
+    const ids = Array.isArray(req.body.ids) ? req.body.ids.map(String) : [];
+    if (!ids.length) return res.status(400).json({ error: "ids[] required" });
 
-            if (clave.includes("CLIENTE")) d.clientName = valor;
-            if (clave.includes("DOMICILIO")) d.addressPart = valor;
-            if (clave.includes("POBLACION")) d.cityPart = valor;
-            if (clave.includes("ACTUALMENTE EN")) d.status_homeserve = valor;
-            if (clave.includes("COMPAÑIA")) d.company = valor;
-            if (clave.includes("FECHA ASIGNACION")) d.dateString = valor;
-            if (clave.includes("COMENTARIOS")) d.description = valor;
-          }
-        });
-        return d;
-      });
+    const appointmentsCol = "appointments";
+    let moved = 0;
 
-      // --- PREPARACIÓN DE DATOS ---
-      const fullAddress = `${detalles.addressPart || ""} ${detalles.cityPart || ""}`.trim();
+    // Procesamos secuencial para controlar mejor errores
+    for (const id of ids) {
+      const pendingRef = db.collection(p.pendingCollection).doc(id);
+      const snap = await pendingRef.get();
+      if (!snap.exists) continue;
 
-      let rawCompany = detalles.company || "";
-      if (!rawCompany.toUpperCase().includes("HOMESERVE")) {
-        rawCompany = `HOMESERVE - ${rawCompany}`;
-      }
+      const d = snap.data() || {};
+      const serviceNumber = d.serviceNumber || id;
 
-      const servicioFinal = {
-        serviceNumber: ref,
-        clientName: detalles.clientName || "Desconocido",
-        address: fullAddress,
-        phone: detalles.phone || "Sin teléfono",
-        description: detalles.description || "",
-        homeserveStatus: detalles.status_homeserve || "",
-        company: rawCompany,
-        dateString: detalles.dateString || "",
-        status: "pendiente_validacion",
-        updatedAt: nowIso(),
+      // Guardamos en appointments con docId = serviceNumber (o id)
+      const appointmentDocId = String(serviceNumber);
+
+      const appointment = {
+        id: appointmentDocId,
+        title: d.description?.trim() ? d.description.trim() : "Servicio",
+        clientName: d.clientName || "",
+        address: d.address || "",
+        phone: d.phone || "",
+        isInsurance: true,
+        insuranceCompany: d.company || "",
+        serviceNumber: serviceNumber,
+        notes: "",
+        clientNotes: "",
+        duration: 60,
+        // lo mandamos a "Alta" -> normalmente pendingStart
+        status: "pendingStart",
+        isUrgent: false,
+        // fecha: si no hay, hoy 00:00 (tú luego lo agendas en la app)
+        date: admin.firestore.Timestamp.fromDate(new Date()),
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        sourceProvider: provider,
+        sourcePendingDocId: id,
       };
 
-      if (!datosAntiguos) servicioFinal.createdAt = nowIso();
+      await db.collection(appointmentsCol).doc(appointmentDocId).set(appointment, { merge: true });
 
-      // --- GUARDADO INTELIGENTE ---
-      if (!datosAntiguos) {
-        await docRef.set(servicioFinal);
-        console.log(`➕ NUEVO: ${ref} (Tlf: ${servicioFinal.phone})`);
-        nuevos++;
-      } else {
-        const cambioEstado = (datosAntiguos.homeserveStatus || "") !== (servicioFinal.homeserveStatus || "");
-        const cambioTelefono = (datosAntiguos.phone || "") !== (servicioFinal.phone || "");
+      // Marcar en pendientes (o si prefieres: borrar)
+      await pendingRef.set({
+        status: "enviado_a_alta",
+        movedAt: new Date().toISOString(),
+        movedToAppointmentId: appointmentDocId,
+      }, { merge: true });
 
-        if (cambioEstado || cambioTelefono) {
-          console.log(`♻️ ACTUALIZADO: ${ref}`);
-          await docRef.set(servicioFinal, { merge: true });
-          actualizados++;
-        }
-      }
+      moved++;
     }
 
-    console.log(`🏁 FIN V6.3: ${nuevos} nuevos, ${actualizados} actualizados.`);
-
-  } catch (error) {
-    console.error('❌ ERROR:', error.message);
-    process.exit(1);
-  } finally {
-    await browser.close();
-    process.exit(0);
+    return res.json({ success: true, moved });
+  } catch (e) {
+    return res.status(400).json({ error: e.message || "Error" });
   }
-}
+});
 
-runRobot();
+// ================== PORT ==================
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log("✅ Server running on port", PORT);
+});
