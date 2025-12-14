@@ -24,6 +24,7 @@ if (process.env.FIREBASE_PRIVATE_KEY) {
 const db = admin.firestore();
 const COLLECTION_NAME = "appointments";
 
+// Fíjate aquí: La función se llama runRobot
 async function runRobot() {
   console.log('🤖 [INICIO] Arrancando robot HomeServe (Modo Seguro)...');
   
@@ -38,12 +39,10 @@ async function runRobot() {
     await page.goto('https://www.clientes.homeserve.es/cgi-bin/fccgi.exe?w3exec=PROF_PASS', { timeout: 30000 });
 
     // --- PASO 2: INTRODUCIR CREDENCIALES ---
-    // IMPORTANTE: Asegúrate de que los selectores ('input[name="Usuario"]', etc.) son los correctos
     const userSelector = 'input[name="Usuario"]';
     const passSelector = 'input[name="Password"]';
     const btnSelector = 'input[type="submit"], button[type="submit"]';
 
-    // Verificamos que existen los campos antes de escribir (por si la web ha cambiado)
     if (await page.isVisible(userSelector) && await page.isVisible(passSelector)) {
         await page.fill(userSelector, process.env.HOMESERVE_USER || ''); 
         await page.fill(passSelector, process.env.HOMESERVE_PASS || '');
@@ -54,23 +53,17 @@ async function runRobot() {
     console.log('👆 Pulsando botón de entrar (Un solo intento)...');
     
     // --- PASO 3: INTENTO DE LOGIN ÚNICO ---
-    // Usamos Promise.race para detectar si entra o si falla/se queda igual
     await Promise.all([
-      page.waitForNavigation({ waitUntil: 'networkidle', timeout: 15000 }), // Esperamos navegación máx 15s
+      page.waitForNavigation({ waitUntil: 'networkidle', timeout: 15000 }), 
       page.click(btnSelector)
     ]);
 
-    // CHEQUEO DE SEGURIDAD POST-LOGIN
+    // CHEQUEO DE SEGURIDAD
     const currentURL = page.url();
-    // Si la URL sigue conteniendo "PROF_PASS" o "error", es que ha fallado.
     if (currentURL.includes('w3exec=PROF_PASS') || currentURL.includes('error')) {
         console.error('⛔ LOGIN FALLIDO: La URL no ha cambiado tras el login.');
-        console.error('   -> Posible usuario/contraseña incorrectos o cuenta bloqueada.');
-        console.error('   -> URL actual:', currentURL);
-        
-        // CERRAMOS INMEDIATAMENTE PARA NO REINTENTAR
         await browser.close();
-        process.exit(1); // Salir con error
+        process.exit(1); 
         return;
     }
 
@@ -91,9 +84,8 @@ async function runRobot() {
 
       filas.forEach(tr => {
         const tds = tr.querySelectorAll('td');
-        // Filtro básico para detectar filas válidas
         if (tds.length > 5) {
-            // AJUSTA ESTOS ÍNDICES SEGÚN LA TABLA REAL QUE INSPECCIONES
+            // AJUSTA ESTOS ÍNDICES SI ES NECESARIO
             let ref = tds[0]?.innerText?.trim();
             let cliente = tds[2]?.innerText?.trim();
             let direccion = tds[3]?.innerText?.trim();
@@ -109,7 +101,7 @@ async function runRobot() {
                     title: "Siniestro HomeServe " + ref,
                     status: "pendingStart",
                     isUrgent: false,
-                    createdAt: new Date().toISOString() // Fecha ISO para consistencia
+                    createdAt: new Date().toISOString()
                 });
             }
         }
@@ -119,14 +111,13 @@ async function runRobot() {
 
     console.log(`📦 Se han detectado ${nuevosServicios.length} servicios.`);
 
-    // --- PASO 6: GUARDAR EN FIREBASE (Sin duplicados) ---
+    // --- PASO 6: GUARDAR EN FIREBASE ---
     let guardados = 0;
     for (const servicio of nuevosServicios) {
       const docRef = db.collection(COLLECTION_NAME).doc(servicio.serviceNumber);
       const doc = await docRef.get();
 
       if (!doc.exists) {
-        // Solo guardamos si NO existe
         await docRef.set({
             ...servicio,
             date: admin.firestore.FieldValue.serverTimestamp()
@@ -140,7 +131,6 @@ async function runRobot() {
 
   } catch (error) {
     console.error('❌ ERROR CRÍTICO EN EL ROBOT:', error.message);
-    // No hacemos reintentos, salimos directamente.
   } finally {
     if (browser) {
         console.log('🔒 Cerrando navegador...');
@@ -151,5 +141,5 @@ async function runRobot() {
   }
 }
 
+// ⚠️ AQUÍ ESTABA EL ERROR: AHORA LLAMAMOS A LA FUNCIÓN CORRECTA
 runRobot();
-sincronizarHomeServe();
