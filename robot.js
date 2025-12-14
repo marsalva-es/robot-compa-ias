@@ -22,12 +22,11 @@ if (process.env.FIREBASE_PRIVATE_KEY) {
 
 const db = admin.firestore();
 
-// ⚠️ CAMBIO 1: NUEVA COLECCIÓN (Bandeja de entrada)
-// Aquí caerán los datos en bruto para que tú los valides desde la App
+// ⚠️ AQUÍ CAMBIAMOS EL NOMBRE DE LA COLECCIÓN PARA NO TOCAR 'APPOINTMENTS'
 const COLLECTION_NAME = "homeserve_pendientes";
 
 async function runRobot() {
-  console.log('🤖 [V5.0] Arrancando robot (Ajuste de Columnas y Colección)...');
+  console.log('🤖 [V5.0] Arrancando robot (Columnas corregidas + Carpeta nueva)...');
   
   const browser = await chromium.launch({ 
     headless: true,
@@ -37,7 +36,7 @@ async function runRobot() {
   const page = await context.newPage();
 
   try {
-    // --- PASO 1: LOGIN (Igual que antes, funciona bien) ---
+    // --- PASO 1: LOGIN ---
     console.log('🔐 Entrando al login...');
     await page.goto('https://www.clientes.homeserve.es/cgi-bin/fccgi.exe?w3exec=PROF_PASS', { timeout: 60000 });
 
@@ -56,12 +55,12 @@ async function runRobot() {
     console.log('📂 Yendo a la Lista de Servicios...');
     await page.goto('https://www.clientes.homeserve.es/cgi-bin/fccgi.exe?w3exec=lista_servicios_total');
     
-    // --- PASO 3: LEER DATOS (CON CORRECCIÓN DE COLUMNAS) ---
+    // --- PASO 3: LEER DATOS (CORRECCIÓN DE COLUMNAS) ---
     const servicios = await page.evaluate(() => {
       const filas = Array.from(document.querySelectorAll('table tr'));
       const datos = [];
       
-      filas.forEach((tr, index) => {
+      filas.forEach((tr) => {
         const tds = tr.querySelectorAll('td');
         
         // Solo miramos filas con datos (más de 5 columnas)
@@ -72,28 +71,25 @@ async function runRobot() {
             if (ref && !isNaN(ref.replace(/\D/g,'')) && ref.length > 3) { 
                 
                 // ⚠️ MAPEO CORREGIDO SEGÚN TUS INDICACIONES ⚠️
-                // Col 0: Referencia (OK)
-                // Col 1: Cliente (Probamos aquí, antes estaba mal)
-                // Col 2: Dirección (Tú dijiste que aquí salía la dirección)
-                // Col 3: Descripción/Estado (Donde salía "En espera...")
-                // Col 4: Fecha (Donde salía "14/08/2025")
-                // Col 5: Teléfono (Probablemente esté aquí)
+                // Col 0: Referencia (14852976)
+                // Col 1: Cliente 
+                // Col 2: Dirección 
+                // Col 3: Población / Estado
+                // Col 4: Fecha
+                // Col 5: Teléfono
 
+                // Ajustamos los índices [1], [2], [5] según lo que hemos visto
                 datos.push({
                     serviceNumber: ref,
-                    clientName: tds[1]?.innerText?.trim() || "Desconocido", // Columna 1
-                    address: tds[2]?.innerText?.trim() || "Sin dirección",  // Columna 2
-                    description: tds[3]?.innerText?.trim(),                 // Columna 3 (Extra)
-                    dateString: tds[4]?.innerText?.trim(),                  // Columna 4 (Fecha original)
-                    phone: tds[5]?.innerText?.trim() || "Sin teléfono",     // Columna 5
+                    clientName: tds[1]?.innerText?.trim() || "Desconocido", 
+                    address: tds[2]?.innerText?.trim() || "Sin dirección",
+                    city: tds[3]?.innerText?.trim() || "",
+                    dateString: tds[4]?.innerText?.trim(),
+                    phone: tds[5]?.innerText?.trim() || "Sin teléfono",
                     
-                    // Campos fijos para tu App
-                    status: "pendiente_validacion", // Estado nuevo para tu Inbox
+                    status: "pendiente_validacion",
                     insuranceCompany: "HOMESERVE",
-                    createdAt: new Date().toISOString(),
-                    
-                    // GUARDAMOS LA FILA ENTERA EN TEXTO PARA DEPURAR (Por si fallamos otra vez)
-                    _debug_raw: tr.innerText 
+                    createdAt: new Date().toISOString()
                 });
             }
         }
@@ -103,16 +99,9 @@ async function runRobot() {
 
     console.log(`📦 Encontrados: ${servicios.length} servicios.`);
 
-    // Imprimimos el primero para que compruebes en el Log si está bien
-    if (servicios.length > 0) {
-        console.log("🔎 EJEMPLO DEL PRIMER SERVICIO CAPTURADO:");
-        console.log(JSON.stringify(servicios[0], null, 2));
-    }
-
     // --- PASO 4: GUARDAR EN LA NUEVA COLECCIÓN ---
     let guardados = 0;
     for (const s of servicios) {
-      // Usamos la nueva colección "homeserve_pendientes"
       const docRef = db.collection(COLLECTION_NAME).doc(s.serviceNumber);
       const doc = await docRef.get();
       
@@ -124,7 +113,7 @@ async function runRobot() {
     }
     
     if (servicios.length > 0 && guardados === 0) {
-        console.log("✅ No hay servicios NUEVOS (ya existían en la colección).");
+        console.log("✅ No hay servicios NUEVOS (ya existen).");
     }
 
   } catch (error) {
