@@ -41,6 +41,7 @@ async function runRobot() {
     const selectorUsuario = 'input[name="CODIGO"]';
     const selectorPass = 'input[type="password"]';
 
+    // Solo intentamos loguearnos si vemos la caja de usuario
     if (await page.isVisible(selectorUsuario)) {
         console.log("📝 Escribiendo usuario...");
         await page.type(selectorUsuario, process.env.HOMESERVE_USER || '', { delay: 100 }); 
@@ -54,10 +55,11 @@ async function runRobot() {
     }
 
     // --- PASO 2: VERIFICACIÓN INTELIGENTE ---
-    // En vez de mirar la URL, miramos si vemos el menú que tú me has pasado
+    // Leemos el texto de la pantalla para saber si estamos dentro
     const textoPantalla = await page.innerText('body');
 
-    if (textoPantalla.includes('PAGINA PRINCIPAL') || textoPantalla.includes('MANTENIMIENTO')) {
+    // SI VEMOS ESTAS PALABRAS, ES QUE HEMOS ENTRADO
+    if (textoPantalla.includes('PAGINA PRINCIPAL') || textoPantalla.includes('ASIGNACIN') || textoPantalla.includes('MANTENIMIENTO')) {
         console.log("✅ ¡LOGIN CORRECTO! Veo el menú principal.");
     } else if (textoPantalla.includes('Usuario incorrecto')) {
         throw new Error("Credenciales incorrectas.");
@@ -67,7 +69,7 @@ async function runRobot() {
 
     // --- PASO 3: IR A LA LISTA DE SERVICIOS ---
     console.log('📂 Yendo directo a la Lista de Servicios...');
-    // Esta es la URL mágica donde están los datos
+    // Esta es la URL donde están los datos
     await page.goto('https://www.clientes.homeserve.es/cgi-bin/fccgi.exe?w3exec=lista_servicios_total');
     
     // --- PASO 4: LEER LA TABLA ---
@@ -114,6 +116,10 @@ async function runRobot() {
     
     if (servicios.length > 0 && guardados === 0) {
         console.log("✅ Todos los servicios ya estaban guardados. No hay novedades.");
+    }
+    
+    if (servicios.length === 0) {
+        console.log("🤷‍♂️ No he visto servicios en la lista (puede que no haya ninguno asignado ahora mismo).");
     }
 
   } catch (error) {
