@@ -16,8 +16,8 @@ async function sincronizarHomeServe() {
     
     // ⚠️ AQUÍ PONES LOS DATOS QUE INSPECCIONASTE ⚠️
     // Ejemplo: si el input se llama 'p_usuario', pones 'input[name="p_usuario"]'
-    await page.fill('input[name="PON_AQUI_NAME_USUARIO"]', 'TU_USUARIO');
-    await page.fill('input[name="PON_AQUI_NAME_PASSWORD"]', 'TU_CONTRASEÑA');
+    await page.fill('input[name="19768"]', 'TU_USUARIO');
+    await page.fill('input[name="Pajarito15$"]', 'TU_CONTRASEÑA');
     
     // Clic en entrar y esperar a que cargue
     await Promise.all([
