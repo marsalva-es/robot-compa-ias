@@ -21,10 +21,13 @@ if (process.env.FIREBASE_PRIVATE_KEY) {
 }
 
 const db = admin.firestore();
-const COLLECTION_NAME = "appointments";
+
+// ⚠️ CAMBIO 1: NUEVA COLECCIÓN (Bandeja de entrada)
+// Aquí caerán los datos en bruto para que tú los valides desde la App
+const COLLECTION_NAME = "homeserve_pendientes";
 
 async function runRobot() {
-  console.log('🤖 [V4.0] Arrancando robot (Versión DEFINITIVA)...');
+  console.log('🤖 [V5.0] Arrancando robot (Ajuste de Columnas y Colección)...');
   
   const browser = await chromium.launch({ 
     headless: true,
@@ -34,63 +37,63 @@ async function runRobot() {
   const page = await context.newPage();
 
   try {
-    // --- PASO 1: LOGIN ---
+    // --- PASO 1: LOGIN (Igual que antes, funciona bien) ---
     console.log('🔐 Entrando al login...');
     await page.goto('https://www.clientes.homeserve.es/cgi-bin/fccgi.exe?w3exec=PROF_PASS', { timeout: 60000 });
 
     const selectorUsuario = 'input[name="CODIGO"]';
     const selectorPass = 'input[type="password"]';
 
-    // Solo intentamos loguearnos si vemos la caja de usuario
     if (await page.isVisible(selectorUsuario)) {
-        console.log("📝 Escribiendo usuario...");
         await page.type(selectorUsuario, process.env.HOMESERVE_USER || '', { delay: 100 }); 
         await page.type(selectorPass, process.env.HOMESERVE_PASS || '', { delay: 100 });
-        
-        console.log('👆 Pulsando ENTER para entrar...');
+        console.log('👆 Pulsando ENTER...');
         await page.keyboard.press('Enter');
-        
-        // Esperamos a que cargue el menú
         await page.waitForTimeout(5000); 
     }
 
-    // --- PASO 2: VERIFICACIÓN INTELIGENTE ---
-    // Leemos el texto de la pantalla para saber si estamos dentro
-    const textoPantalla = await page.innerText('body');
-
-    // SI VEMOS ESTAS PALABRAS, ES QUE HEMOS ENTRADO
-    if (textoPantalla.includes('PAGINA PRINCIPAL') || textoPantalla.includes('ASIGNACIN') || textoPantalla.includes('MANTENIMIENTO')) {
-        console.log("✅ ¡LOGIN CORRECTO! Veo el menú principal.");
-    } else if (textoPantalla.includes('Usuario incorrecto')) {
-        throw new Error("Credenciales incorrectas.");
-    } else {
-        console.log("⚠️ No estoy seguro de dónde estoy, pero voy a intentar ir a la lista de todos modos.");
-    }
-
-    // --- PASO 3: IR A LA LISTA DE SERVICIOS ---
-    console.log('📂 Yendo directo a la Lista de Servicios...');
-    // Esta es la URL donde están los datos
+    // --- PASO 2: IR A LA LISTA ---
+    console.log('📂 Yendo a la Lista de Servicios...');
     await page.goto('https://www.clientes.homeserve.es/cgi-bin/fccgi.exe?w3exec=lista_servicios_total');
     
-    // --- PASO 4: LEER LA TABLA ---
+    // --- PASO 3: LEER DATOS (CON CORRECCIÓN DE COLUMNAS) ---
     const servicios = await page.evaluate(() => {
       const filas = Array.from(document.querySelectorAll('table tr'));
       const datos = [];
-      filas.forEach(tr => {
+      
+      filas.forEach((tr, index) => {
         const tds = tr.querySelectorAll('td');
-        // Si la fila tiene muchas columnas, es un servicio
+        
+        // Solo miramos filas con datos (más de 5 columnas)
         if (tds.length > 5) {
-            let ref = tds[0]?.innerText?.trim(); // Columna 1: Referencia
+            let ref = tds[0]?.innerText?.trim(); 
             
-            // Filtro de seguridad: ¿Es un número de verdad?
+            // Validamos que sea un número de servicio real
             if (ref && !isNaN(ref.replace(/\D/g,'')) && ref.length > 3) { 
+                
+                // ⚠️ MAPEO CORREGIDO SEGÚN TUS INDICACIONES ⚠️
+                // Col 0: Referencia (OK)
+                // Col 1: Cliente (Probamos aquí, antes estaba mal)
+                // Col 2: Dirección (Tú dijiste que aquí salía la dirección)
+                // Col 3: Descripción/Estado (Donde salía "En espera...")
+                // Col 4: Fecha (Donde salía "14/08/2025")
+                // Col 5: Teléfono (Probablemente esté aquí)
+
                 datos.push({
                     serviceNumber: ref,
-                    clientName: tds[2]?.innerText?.trim(), // Columna 3: Cliente
-                    address: tds[3]?.innerText?.trim(),    // Columna 4: Dirección
-                    phone: tds[4]?.innerText?.trim(),      // Columna 5: Teléfono
-                    status: "pendingStart",
-                    createdAt: new Date().toISOString()
+                    clientName: tds[1]?.innerText?.trim() || "Desconocido", // Columna 1
+                    address: tds[2]?.innerText?.trim() || "Sin dirección",  // Columna 2
+                    description: tds[3]?.innerText?.trim(),                 // Columna 3 (Extra)
+                    dateString: tds[4]?.innerText?.trim(),                  // Columna 4 (Fecha original)
+                    phone: tds[5]?.innerText?.trim() || "Sin teléfono",     // Columna 5
+                    
+                    // Campos fijos para tu App
+                    status: "pendiente_validacion", // Estado nuevo para tu Inbox
+                    insuranceCompany: "HOMESERVE",
+                    createdAt: new Date().toISOString(),
+                    
+                    // GUARDAMOS LA FILA ENTERA EN TEXTO PARA DEPURAR (Por si fallamos otra vez)
+                    _debug_raw: tr.innerText 
                 });
             }
         }
@@ -98,28 +101,30 @@ async function runRobot() {
       return datos;
     });
 
-    console.log(`📦 ¡HEMOS TRIUNFADO! Encontrados: ${servicios.length} servicios.`);
+    console.log(`📦 Encontrados: ${servicios.length} servicios.`);
 
-    // --- PASO 5: GUARDAR EN FIREBASE ---
+    // Imprimimos el primero para que compruebes en el Log si está bien
+    if (servicios.length > 0) {
+        console.log("🔎 EJEMPLO DEL PRIMER SERVICIO CAPTURADO:");
+        console.log(JSON.stringify(servicios[0], null, 2));
+    }
+
+    // --- PASO 4: GUARDAR EN LA NUEVA COLECCIÓN ---
     let guardados = 0;
     for (const s of servicios) {
+      // Usamos la nueva colección "homeserve_pendientes"
       const docRef = db.collection(COLLECTION_NAME).doc(s.serviceNumber);
       const doc = await docRef.get();
       
-      // Solo guardamos si NO existe ya (para no machacar datos)
       if (!doc.exists) {
         await docRef.set(s);
-        console.log(`➕ Guardado en Firebase: ${s.serviceNumber}`);
+        console.log(`➕ Guardado en ${COLLECTION_NAME}: ${s.serviceNumber}`);
         guardados++;
       }
     }
     
     if (servicios.length > 0 && guardados === 0) {
-        console.log("✅ Todos los servicios ya estaban guardados. No hay novedades.");
-    }
-    
-    if (servicios.length === 0) {
-        console.log("🤷‍♂️ No he visto servicios en la lista (puede que no haya ninguno asignado ahora mismo).");
+        console.log("✅ No hay servicios NUEVOS (ya existían en la colección).");
     }
 
   } catch (error) {
@@ -127,7 +132,7 @@ async function runRobot() {
     process.exit(1);
   } finally {
     await browser.close();
-    console.log('🏁 Misión cumplida.');
+    console.log('🏁 Fin V5.0');
     process.exit(0);
   }
 }
