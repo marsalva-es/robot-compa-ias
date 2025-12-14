@@ -24,7 +24,7 @@ const db = admin.firestore();
 const COLLECTION_NAME = "homeserve_pendientes";
 
 async function runRobot() {
-  console.log('🤖 [V6.1] Arrancando robot (Dirección Unificada + Actualización de Estado)...');
+  console.log('🤖 [V6.2] Arrancando robot (Limpieza de Teléfono)...');
   
   const browser = await chromium.launch({ 
     headless: true,
@@ -49,7 +49,7 @@ async function runRobot() {
         await page.waitForTimeout(5000); 
     }
 
-    // --- PASO 2: OBTENER LISTA DE REFERENCIAS ---
+    // --- PASO 2: OBTENER LISTA ---
     console.log('📂 Leyendo lista de servicios...');
     await page.goto('https://www.clientes.homeserve.es/cgi-bin/fccgi.exe?w3exec=lista_servicios_total');
     
@@ -68,37 +68,31 @@ async function runRobot() {
       return refs;
     });
 
-    console.log(`🔎 Encontrados ${referenciasEnWeb.length} servicios en la web. Revisando uno a uno...`);
+    console.log(`🔎 Encontrados ${referenciasEnWeb.length} servicios.`);
 
-    // --- PASO 3: PROCESAR CADA SERVICIO ---
+    // --- PASO 3: PROCESAR UNO A UNO ---
     let actualizados = 0;
     let nuevos = 0;
 
     for (const ref of referenciasEnWeb) {
         
-        // 1. Antes de entrar, miramos si existe en Firebase para comparar el estado
         const docRef = db.collection(COLLECTION_NAME).doc(ref);
         const docSnapshot = await docRef.get();
         let datosAntiguos = null;
 
-        if (docSnapshot.exists) {
-            datosAntiguos = docSnapshot.data();
-        }
+        if (docSnapshot.exists) datosAntiguos = docSnapshot.data();
 
-        // 2. Entramos SIEMPRE a la ficha para leer los datos frescos de la web
-        // (Necesario para ver si el estado ha cambiado)
+        // Navegar a la lista y hacer click (para refrescar sesión y datos)
         await page.goto('https://www.clientes.homeserve.es/cgi-bin/fccgi.exe?w3exec=lista_servicios_total');
-        
         try {
-            // Buscamos el click por el número de referencia
             await page.click(`text="${ref}"`);
             await page.waitForTimeout(1500); 
         } catch (e) {
-            console.error(`⚠️ No pude entrar en la ficha ${ref}. Saltando.`);
+            console.error(`⚠️ No pude entrar en ficha ${ref}.`);
             continue;
         }
 
-        // 3. LEEMOS LOS DATOS (SCRAPING)
+        // --- SCRAPING CON LIMPIEZA DE TELÉFONO ---
         const detalles = await page.evaluate(() => {
             const d = {};
             const filas = Array.from(document.querySelectorAll('tr'));
@@ -106,12 +100,19 @@ async function runRobot() {
                 const celdas = tr.querySelectorAll('td');
                 if (celdas.length >= 2) {
                     const clave = celdas[0].innerText.toUpperCase().trim();
-                    const valor = celdas[1].innerText.trim();
+                    const valor = celdas[1].innerText.trim(); // Texto sucio (con horas, nombres...)
 
-                    if (clave.includes("TELEFONOS")) d.phone = valor;
+                    // ⚠️ AQUÍ ESTÁ EL CAMBIO DE LIMPIEZA
+                    if (clave.includes("TELEFONOS")) {
+                        // Buscamos 9 dígitos seguidos que empiecen por 6,7,8 o 9
+                        const match = valor.match(/[6789]\d{8}/);
+                        // Si encontramos un número, nos quedamos SOLO con él. Si no, guardamos el texto original.
+                        d.phone = match ? match[0] : valor;
+                    }
+                    
                     if (clave.includes("CLIENTE")) d.clientName = valor;
-                    if (clave.includes("DOMICILIO")) d.addressPart = valor; // Parte 1 dirección
-                    if (clave.includes("POBLACION")) d.cityPart = valor;    // Parte 2 dirección
+                    if (clave.includes("DOMICILIO")) d.addressPart = valor;
+                    if (clave.includes("POBLACION")) d.cityPart = valor;
                     if (clave.includes("ACTUALMENTE EN")) d.status_homeserve = valor;
                     if (clave.includes("COMPAÑIA")) d.company = valor;
                     if (clave.includes("FECHA ASIGNACION")) d.dateString = valor;
@@ -121,69 +122,48 @@ async function runRobot() {
             return d;
         });
 
-        // 4. PREPARAMOS LOS DATOS (Lógica nueva)
-        
-        // A) Juntar Domicilio + Población en 'address'
+        // --- PREPARACIÓN DE DATOS ---
         const fullAddress = `${detalles.addressPart || ""} ${detalles.cityPart || ""}`.trim();
 
-        // B) Añadir prefijo HOMESERVE a la compañía
         let rawCompany = detalles.company || "";
-        // Evitamos poner "HOMESERVE - HOMESERVE..." si ya lo tiene
         if (!rawCompany.toUpperCase().includes("HOMESERVE")) {
             rawCompany = `HOMESERVE - ${rawCompany}`;
         }
-        const finalCompany = rawCompany;
-
+        
         const servicioFinal = {
             serviceNumber: ref,
             clientName: detalles.clientName || "Desconocido",
-            address: fullAddress, // Campo unificado
-            phone: detalles.phone || "Sin teléfono",
+            address: fullAddress, 
+            phone: detalles.phone || "Sin teléfono", // Ahora vendrá limpio (solo números)
             description: detalles.description || "",
             homeserveStatus: detalles.status_homeserve || "",
-            company: finalCompany, // Con prefijo
+            company: rawCompany,
             dateString: detalles.dateString || "",
-            
             status: "pendiente_validacion",
             updatedAt: new Date().toISOString()
         };
 
-        // Si es nuevo, añadimos fecha de creación
-        if (!datosAntiguos) {
-            servicioFinal.createdAt = new Date().toISOString();
-        }
+        if (!datosAntiguos) servicioFinal.createdAt = new Date().toISOString();
 
-        // 5. DECISIÓN: ¿GUARDAR O NO?
-        
+        // --- GUARDADO INTELIGENTE ---
         if (!datosAntiguos) {
-            // CASO 1: NO EXISTE -> CREAR
             await docRef.set(servicioFinal);
-            console.log(`➕ NUEVO servicio guardado: ${ref}`);
+            console.log(`➕ NUEVO: ${ref} (Tlf: ${servicioFinal.phone})`);
             nuevos++;
         } else {
-            // CASO 2: YA EXISTE -> COMPARAR ESTADO
-            const estadoAntiguo = datosAntiguos.homeserveStatus;
-            const estadoNuevo = servicioFinal.homeserveStatus;
+            // Comparamos estado O si el teléfono antes estaba sucio y ahora limpio
+            const cambioEstado = datosAntiguos.homeserveStatus !== servicioFinal.homeserveStatus;
+            const cambioTelefono = datosAntiguos.phone !== servicioFinal.phone;
 
-            // También actualizamos si la dirección antigua no tenía el formato nuevo
-            // (Esto arreglará los registros que guardaste hace 10 minutos mal)
-            const direccionAntigua = datosAntiguos.address;
-
-            if (estadoAntiguo !== estadoNuevo) {
-                console.log(`♻️ CAMBIO DETECTADO en ${ref}: "${estadoAntiguo}" -> "${estadoNuevo}". Actualizando...`);
+            if (cambioEstado || cambioTelefono) {
+                console.log(`♻️ ACTUALIZADO: ${ref}`);
                 await docRef.set(servicioFinal, { merge: true });
                 actualizados++;
-            } else if (direccionAntigua !== fullAddress) {
-                console.log(`🔧 Corrigiendo formato dirección en ${ref}. Actualizando...`);
-                await docRef.set(servicioFinal, { merge: true });
-                actualizados++;
-            } else {
-                console.log(`zzz El servicio ${ref} no ha cambiado. Salto.`);
             }
         }
     }
 
-    console.log(`🏁 FIN: ${nuevos} nuevos, ${actualizados} actualizados.`);
+    console.log(`🏁 FIN V6.2: ${nuevos} nuevos, ${actualizados} actualizados.`);
 
   } catch (error) {
     console.error('❌ ERROR:', error.message);
