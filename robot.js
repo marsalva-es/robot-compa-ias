@@ -24,7 +24,7 @@ const db = admin.firestore();
 const COLLECTION_NAME = "homeserve_pendientes";
 
 async function runRobot() {
-  console.log('🤖 [V6.0] Arrancando robot (Modo FICHA DETALLADA)...');
+  console.log('🤖 [V6.1] Arrancando robot (Dirección Unificada + Actualización de Estado)...');
   
   const browser = await chromium.launch({ 
     headless: true,
@@ -34,7 +34,7 @@ async function runRobot() {
   const page = await context.newPage();
 
   try {
-    // --- PASO 1: LOGIN (Mismo método que sabemos que funciona) ---
+    // --- PASO 1: LOGIN ---
     console.log('🔐 Entrando al login...');
     await page.goto('https://www.clientes.homeserve.es/cgi-bin/fccgi.exe?w3exec=PROF_PASS', { timeout: 60000 });
 
@@ -49,11 +49,10 @@ async function runRobot() {
         await page.waitForTimeout(5000); 
     }
 
-    // --- PASO 2: OBTENER LISTA DE IDs NUEVOS ---
-    console.log('📂 Leyendo lista para detectar nuevos servicios...');
+    // --- PASO 2: OBTENER LISTA DE REFERENCIAS ---
+    console.log('📂 Leyendo lista de servicios...');
     await page.goto('https://www.clientes.homeserve.es/cgi-bin/fccgi.exe?w3exec=lista_servicios_total');
     
-    // Solo sacamos los NUMEROS de referencia primero
     const referenciasEnWeb = await page.evaluate(() => {
       const filas = Array.from(document.querySelectorAll('table tr'));
       const refs = [];
@@ -69,95 +68,128 @@ async function runRobot() {
       return refs;
     });
 
-    console.log(`🔎 Detectados ${referenciasEnWeb.length} servicios en la lista.`);
+    console.log(`🔎 Encontrados ${referenciasEnWeb.length} servicios en la web. Revisando uno a uno...`);
 
-    // --- PASO 3: PROCESAR UNO A UNO (Entrando en el detalle) ---
-    let guardados = 0;
+    // --- PASO 3: PROCESAR CADA SERVICIO ---
+    let actualizados = 0;
+    let nuevos = 0;
 
     for (const ref of referenciasEnWeb) {
-        // 1. Chequeo rápido: ¿Ya lo tenemos en Firebase?
+        
+        // 1. Antes de entrar, miramos si existe en Firebase para comparar el estado
         const docRef = db.collection(COLLECTION_NAME).doc(ref);
-        const doc = await docRef.get();
+        const docSnapshot = await docRef.get();
+        let datosAntiguos = null;
 
-        if (doc.exists) {
-            console.log(`⏩ El servicio ${ref} ya existe. Saltando...`);
-            continue;
+        if (docSnapshot.exists) {
+            datosAntiguos = docSnapshot.data();
         }
 
-        console.log(`🆕 ¡NUEVO SERVICIO ${ref}! Entrando a ver detalles...`);
-
-        // 2. Si es nuevo, navegamos a la lista de nuevo para tener el link fresco
-        // (Esto es más seguro en webs viejas que navegar directo por URL)
+        // 2. Entramos SIEMPRE a la ficha para leer los datos frescos de la web
+        // (Necesario para ver si el estado ha cambiado)
         await page.goto('https://www.clientes.homeserve.es/cgi-bin/fccgi.exe?w3exec=lista_servicios_total');
         
-        // 3. Buscamos el enlace con ese número y hacemos clic
-        // Playwright buscará un enlace o texto que coincida con la referencia
         try {
+            // Buscamos el click por el número de referencia
             await page.click(`text="${ref}"`);
-            await page.waitForTimeout(2000); // Esperamos a que cargue la ficha amarilla
+            await page.waitForTimeout(1500); 
         } catch (e) {
-            console.error(`⚠️ No pude hacer clic en ${ref}. Lo intento en la próxima vuelta.`);
+            console.error(`⚠️ No pude entrar en la ficha ${ref}. Saltando.`);
             continue;
         }
 
-        // 4. SCRAPING DE LA FICHA AMARILLA (Tu captura de pantalla)
+        // 3. LEEMOS LOS DATOS (SCRAPING)
         const detalles = await page.evaluate(() => {
-            const datos = {};
-            // Buscamos todas las filas de la tabla de detalle
+            const d = {};
             const filas = Array.from(document.querySelectorAll('tr'));
-            
             filas.forEach(tr => {
                 const celdas = tr.querySelectorAll('td');
                 if (celdas.length >= 2) {
-                    // La celda izquierda es la CLAVE (ej: "TELEFONOS:")
-                    // La celda derecha es el VALOR (ej: "606033322...")
                     const clave = celdas[0].innerText.toUpperCase().trim();
                     const valor = celdas[1].innerText.trim();
 
-                    if (clave.includes("TELEFONOS")) datos.phone = valor;
-                    if (clave.includes("CLIENTE")) datos.clientName = valor;
-                    if (clave.includes("DOMICILIO")) datos.address = valor;
-                    if (clave.includes("POBLACION")) datos.city = valor;
-                    if (clave.includes("ACTUALMENTE EN")) datos.status_homeserve = valor;
-                    if (clave.includes("COMPAÑIA")) datos.company = valor;
-                    if (clave.includes("FECHA ASIGNACION")) datos.dateString = valor;
-                    if (clave.includes("COMENTARIOS")) datos.description = valor;
+                    if (clave.includes("TELEFONOS")) d.phone = valor;
+                    if (clave.includes("CLIENTE")) d.clientName = valor;
+                    if (clave.includes("DOMICILIO")) d.addressPart = valor; // Parte 1 dirección
+                    if (clave.includes("POBLACION")) d.cityPart = valor;    // Parte 2 dirección
+                    if (clave.includes("ACTUALMENTE EN")) d.status_homeserve = valor;
+                    if (clave.includes("COMPAÑIA")) d.company = valor;
+                    if (clave.includes("FECHA ASIGNACION")) d.dateString = valor;
+                    if (clave.includes("COMENTARIOS")) d.description = valor;
                 }
             });
-            return datos;
+            return d;
         });
 
-        // 5. Completamos el objeto para Firebase
+        // 4. PREPARAMOS LOS DATOS (Lógica nueva)
+        
+        // A) Juntar Domicilio + Población en 'address'
+        const fullAddress = `${detalles.addressPart || ""} ${detalles.cityPart || ""}`.trim();
+
+        // B) Añadir prefijo HOMESERVE a la compañía
+        let rawCompany = detalles.company || "";
+        // Evitamos poner "HOMESERVE - HOMESERVE..." si ya lo tiene
+        if (!rawCompany.toUpperCase().includes("HOMESERVE")) {
+            rawCompany = `HOMESERVE - ${rawCompany}`;
+        }
+        const finalCompany = rawCompany;
+
         const servicioFinal = {
             serviceNumber: ref,
             clientName: detalles.clientName || "Desconocido",
-            address: detalles.address || "Sin dirección",
-            city: detalles.city || "",
+            address: fullAddress, // Campo unificado
             phone: detalles.phone || "Sin teléfono",
             description: detalles.description || "",
             homeserveStatus: detalles.status_homeserve || "",
-            company: detalles.company || "HOMESERVE",
-            dateString: detalles.dateString || "", // Guardamos la fecha original texto
+            company: finalCompany, // Con prefijo
+            dateString: detalles.dateString || "",
             
-            status: "pendiente_validacion", // Estado para tu App
-            createdAt: new Date().toISOString(),
-            source: "Robot V6.0 Detallado"
+            status: "pendiente_validacion",
+            updatedAt: new Date().toISOString()
         };
 
-        // 6. Guardamos
-        await docRef.set(servicioFinal);
-        console.log(`✅ Guardado con detalle completo: ${ref}`);
-        guardados++;
+        // Si es nuevo, añadimos fecha de creación
+        if (!datosAntiguos) {
+            servicioFinal.createdAt = new Date().toISOString();
+        }
+
+        // 5. DECISIÓN: ¿GUARDAR O NO?
+        
+        if (!datosAntiguos) {
+            // CASO 1: NO EXISTE -> CREAR
+            await docRef.set(servicioFinal);
+            console.log(`➕ NUEVO servicio guardado: ${ref}`);
+            nuevos++;
+        } else {
+            // CASO 2: YA EXISTE -> COMPARAR ESTADO
+            const estadoAntiguo = datosAntiguos.homeserveStatus;
+            const estadoNuevo = servicioFinal.homeserveStatus;
+
+            // También actualizamos si la dirección antigua no tenía el formato nuevo
+            // (Esto arreglará los registros que guardaste hace 10 minutos mal)
+            const direccionAntigua = datosAntiguos.address;
+
+            if (estadoAntiguo !== estadoNuevo) {
+                console.log(`♻️ CAMBIO DETECTADO en ${ref}: "${estadoAntiguo}" -> "${estadoNuevo}". Actualizando...`);
+                await docRef.set(servicioFinal, { merge: true });
+                actualizados++;
+            } else if (direccionAntigua !== fullAddress) {
+                console.log(`🔧 Corrigiendo formato dirección en ${ref}. Actualizando...`);
+                await docRef.set(servicioFinal, { merge: true });
+                actualizados++;
+            } else {
+                console.log(`zzz El servicio ${ref} no ha cambiado. Salto.`);
+            }
+        }
     }
 
-    if (guardados === 0) console.log("💤 Todo al día. No hay nuevos servicios.");
+    console.log(`🏁 FIN: ${nuevos} nuevos, ${actualizados} actualizados.`);
 
   } catch (error) {
     console.error('❌ ERROR:', error.message);
     process.exit(1);
   } finally {
     await browser.close();
-    console.log('🏁 Fin V6.0');
     process.exit(0);
   }
 }
