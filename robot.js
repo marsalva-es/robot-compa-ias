@@ -1,328 +1,206 @@
-// server.js (CommonJS)
-const express = require("express");
-const cors = require("cors");
-const admin = require("firebase-admin");
-const crypto = require("crypto");
+const { chromium } = require('playwright');
+const admin = require('firebase-admin');
 
-// =====================
-// Firebase Admin (ENV)
-// =====================
-if (!admin.apps.length) {
-  if (!process.env.FIREBASE_PRIVATE_KEY) {
-    console.error("⚠️ FALTAN LAS CLAVES DE FIREBASE EN ENV");
+// --- CONFIGURACIÓN FIREBASE (desde ENV de Render) ---
+if (process.env.FIREBASE_PRIVATE_KEY) {
+  try {
+    admin.initializeApp({
+      credential: admin.credential.cert({
+        projectId: process.env.FIREBASE_PROJECT_ID,
+        clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+        privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+      }),
+    });
+  } catch (err) {
+    console.error("❌ Error inicializando Firebase:", err.message);
     process.exit(1);
   }
-
-  admin.initializeApp({
-    credential: admin.credential.cert({
-      projectId: process.env.FIREBASE_PROJECT_ID,
-      clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-      privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n"),
-    }),
-  });
+} else {
+  console.error("⚠️ FALTAN LAS CLAVES DE FIREBASE");
+  process.exit(1);
 }
 
 const db = admin.firestore();
 
-// =====================
-// Express
-// =====================
-const app = express();
-app.use(cors({ origin: true }));
-app.use(express.json({ limit: "1mb" }));
+const COLLECTION_NAME = "homeserve_pendientes";
+const PROVIDER_DOC = "homeserve"; // providerCredentials/homeserve
 
-// =====================
-// Helpers
-// =====================
-function providerToPendingCollection(provider) {
-  // Deja preparados futuros proveedores
-  switch (String(provider || "").toLowerCase()) {
-    case "homeserve":
-      return "homeserve_pendientes";
-    case "multiasistencia":
-      return "multiasistencia_pendientes";
-    case "todo":
-      return "todo_pendientes";
-    default:
-      return null;
-  }
+async function getProviderCredentials(providerDocId) {
+  const snap = await db.collection("providerCredentials").doc(providerDocId).get();
+  if (!snap.exists) throw new Error(`No existe providerCredentials/${providerDocId} en Firestore`);
+
+  const data = snap.data() || {};
+  const user = String(data.user || "").trim();
+  const pass = String(data.pass || "").trim();
+  if (!user || !pass) throw new Error(`providerCredentials/${providerDocId} no tiene user/pass completos`);
+
+  return { user, pass };
 }
 
-function isBlockedService(data) {
-  if (!data) return true;
+async function runRobot() {
+  console.log('🤖 [V7.1] Arrancando robot (credenciales desde Firestore + filtro SERVICIO)...');
 
-  // Si el robot lo marca explícitamente
-  if (data.blocked === true) return true;
-
-  const status = String(data.status || "").toLowerCase();
-  if (status === "bloqueado" || status === "blocked" || status === "locked") return true;
-
-  const hs = String(data.homeserveStatus || "").toLowerCase();
-  // Palabras típicas de bloqueo / acceso denegado
-  if (
-    /bloquead|acceso\s+deneg|no\s+autoriz|sin\s+acceso|no\s+disponible|restric/i.test(hs)
-  ) {
-    return true;
-  }
-
-  // Heurística: si faltan datos críticos, probablemente no pudimos entrar
-  const clientName = String(data.clientName || "").trim();
-  const address = String(data.address || "").trim();
-  const phone = String(data.phone || "").trim();
-
-  let missing = 0;
-  if (!clientName || clientName.toLowerCase() === "desconocido") missing++;
-  if (!address) missing++;
-  if (!phone || phone.toLowerCase().includes("sin teléfono") || phone.toLowerCase().includes("sin telefono")) missing++;
-
-  // Si faltan 2 o más de los 3, lo consideramos NO importable
-  if (missing >= 2) return true;
-
-  return false;
-}
-
-async function requireAuth(req, res, next) {
+  // 0) Leer credenciales desde Firebase
+  let creds;
   try {
-    const h = req.headers.authorization || "";
-    const m = h.match(/^Bearer\s+(.+)$/i);
-    if (!m) return res.status(401).json({ error: "Missing Bearer token" });
-
-    const decoded = await admin.auth().verifyIdToken(m[1]);
-    req.user = decoded;
-    next();
+    creds = await getProviderCredentials(PROVIDER_DOC);
+    console.log(`🔐 Credenciales cargadas OK: provider=${PROVIDER_DOC} user=${creds.user}`);
   } catch (e) {
-    return res.status(401).json({ error: "Invalid token" });
+    console.error("❌ No se pudieron cargar credenciales del proveedor:", e.message);
+    process.exit(1);
   }
-}
 
-async function requireAdmin(req, res, next) {
-  try {
-    const uid = req.user?.uid;
-    if (!uid) return res.status(401).json({ error: "No user" });
-
-    const snap = await db.collection("adminUsers").doc(uid).get();
-    const data = snap.exists ? snap.data() : null;
-
-    if (!data?.enabled) {
-      return res.status(403).json({ error: "No tienes permisos de admin para este panel." });
-    }
-    next();
-  } catch (e) {
-    return res.status(500).json({ error: "Admin check failed" });
-  }
-}
-
-// =====================
-// Health
-// =====================
-app.get("/health", (req, res) => res.json({ ok: true }));
-
-// =====================
-// Admin: Provider credentials
-// =====================
-app.get("/admin/config/:provider", requireAuth, requireAdmin, async (req, res) => {
-  const provider = String(req.params.provider || "").toLowerCase();
+  const browser = await chromium.launch({
+    headless: true,
+    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+  });
+  const context = await browser.newContext();
+  const page = await context.newPage();
 
   try {
-    const ref = db.collection("providerCredentials").doc(provider);
-    const snap = await ref.get();
-    const data = snap.exists ? snap.data() : {};
+    // --- PASO 1: LOGIN ---
+    console.log('🔐 Entrando al login...');
+    await page.goto('https://www.clientes.homeserve.es/cgi-bin/fccgi.exe?w3exec=PROF_PASS', { timeout: 60000 });
 
-    res.json({
-      provider,
-      user: data.user || "",
-      hasPass: !!data.pass,
-      lastChange:
-        data.updatedAt?.toDate?.()?.toISOString?.() ||
-        data.updatedAt ||
-        data.lastChange ||
-        null,
-    });
-  } catch (e) {
-    res.status(500).json({ error: "No se pudo cargar configuración" });
-  }
-});
+    const selectorUsuario = 'input[name="CODIGO"]';
+    const selectorPass = 'input[type="password"]';
 
-app.post("/admin/config/:provider", requireAuth, requireAdmin, async (req, res) => {
-  const provider = String(req.params.provider || "").toLowerCase();
-  const user = String(req.body?.user || "").trim();
-  const pass = req.body?.pass; // puede ser "********"
+    if (await page.isVisible(selectorUsuario)) {
+      await page.fill(selectorUsuario, "");
+      await page.fill(selectorPass, "");
+      await page.type(selectorUsuario, creds.user, { delay: 100 });
+      await page.type(selectorPass, creds.pass, { delay: 100 });
 
-  if (!user) return res.status(400).json({ error: "Falta user" });
-
-  try {
-    const ref = db.collection("providerCredentials").doc(provider);
-    const snap = await ref.get();
-    const old = snap.exists ? snap.data() : {};
-
-    let newPass = String(pass || "").trim();
-    if (newPass === "********" || newPass === "") {
-      newPass = String(old?.pass || "").trim();
+      console.log('👆 Pulsando ENTER...');
+      await page.keyboard.press('Enter');
+      await page.waitForTimeout(5000);
+    } else {
+      console.log("⚠️ No veo el formulario de login (puede que ya esté logueado o cambió la web).");
     }
 
-    if (!newPass) return res.status(400).json({ error: "Falta pass" });
+    // --- PASO 2: OBTENER LISTA ---
+    console.log('📂 Leyendo lista de servicios...');
+    await page.goto('https://www.clientes.homeserve.es/cgi-bin/fccgi.exe?w3exec=lista_servicios_total');
 
-    await ref.set(
-      {
-        user,
-        pass: newPass,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      },
-      { merge: true }
-    );
+    const referenciasEnWeb = await page.evaluate(() => {
+      const filas = Array.from(document.querySelectorAll('table tr'));
+      const refs = [];
 
-    res.json({ success: true });
-  } catch (e) {
-    res.status(500).json({ error: "No se pudo guardar configuración" });
-  }
-});
-
-// =====================
-// Admin: Services list (pendientes)
-// =====================
-app.get("/admin/services/:provider", requireAuth, requireAdmin, async (req, res) => {
-  const provider = String(req.params.provider || "").toLowerCase();
-  const col = providerToPendingCollection(provider);
-  if (!col) return res.status(400).json({ error: "Proveedor inválido" });
-
-  const includeBlocked = String(req.query.includeBlocked || "0") === "1";
-
-  try {
-    // Leemos y filtramos en servidor (simple y robusto)
-    const snap = await db.collection(col).get();
-    const out = [];
-
-    snap.forEach((d) => {
-      const data = d.data() || {};
-      const blocked = isBlockedService(data);
-
-      if (!includeBlocked && blocked) return;
-
-      out.push({
-        id: d.id,
-        serviceNumber: data.serviceNumber || d.id,
-        client: data.clientName || "Cliente",
-        address: data.address || "",
-        phone: data.phone || "",
-        company: data.company || "",
-        homeserveStatus: data.homeserveStatus || "",
-        status: data.status || "",
-        blocked,
+      filas.forEach(tr => {
+        const tds = tr.querySelectorAll('td');
+        if (tds.length > 0) {
+          const raw = (tds[0]?.innerText || "").trim();
+          // ✅ sacamos solo dígitos (si no hay dígitos, fuera → "SERVICIO" muere aquí)
+          const digits = raw.replace(/\D/g, "");
+          if (/^\d{4,}$/.test(digits)) refs.push(digits);
+        }
       });
+
+      // quitar duplicados por si acaso
+      return Array.from(new Set(refs));
     });
 
-    // Orden “nice”: por updatedAt si existe
-    out.sort((a, b) => {
-      const ad = Date.parse(a.updatedAt || "") || 0;
-      const bd = Date.parse(b.updatedAt || "") || 0;
-      return bd - ad;
-    });
+    console.log(`🔎 Encontrados ${referenciasEnWeb.length} servicios válidos.`);
 
-    res.json(out);
-  } catch (e) {
-    res.status(500).json({ error: "No se pudieron cargar servicios" });
-  }
-});
+    // --- PASO 3: PROCESAR UNO A UNO ---
+    let actualizados = 0;
+    let nuevos = 0;
 
-// =====================
-// Admin: Delete pending services
-// =====================
-app.post("/admin/services/:provider/delete", requireAuth, requireAdmin, async (req, res) => {
-  const provider = String(req.params.provider || "").toLowerCase();
-  const col = providerToPendingCollection(provider);
-  if (!col) return res.status(400).json({ error: "Proveedor inválido" });
+    for (const ref of referenciasEnWeb) {
+      const docRef = db.collection(COLLECTION_NAME).doc(ref);
+      const docSnapshot = await docRef.get();
+      const datosAntiguos = docSnapshot.exists ? docSnapshot.data() : null;
 
-  const ids = Array.isArray(req.body?.ids) ? req.body.ids : [];
-  if (!ids.length) return res.json({ success: true, deleted: 0 });
+      // Navegar a la lista y hacer click
+      await page.goto('https://www.clientes.homeserve.es/cgi-bin/fccgi.exe?w3exec=lista_servicios_total');
+      try {
+        await page.click(`text="${ref}"`);
+        await page.waitForTimeout(1500);
+      } catch (e) {
+        // ✅ si está bloqueado y no se puede entrar, lo marcamos bloqueado (para que NO se pueda dar de alta)
+        const blockedDoc = {
+          serviceNumber: ref,
+          blocked: true,
+          blockedReason: "No se pudo entrar en ficha (posible bloqueo de compañía)",
+          status: "blocked",
+          updatedAt: new Date().toISOString(),
+        };
+        if (!datosAntiguos) blockedDoc.createdAt = new Date().toISOString();
 
-  try {
-    const batch = db.batch();
-    ids.forEach((id) => batch.delete(db.collection(col).doc(String(id))));
-    await batch.commit();
-    res.json({ success: true, deleted: ids.length });
-  } catch (e) {
-    res.status(500).json({ error: "No se pudieron borrar" });
-  }
-});
-
-// =====================
-// Admin: Import to appointments (BLOCKED FILTER HERE)
-// =====================
-app.post("/admin/services/:provider/to-appointments", requireAuth, requireAdmin, async (req, res) => {
-  const provider = String(req.params.provider || "").toLowerCase();
-  const col = providerToPendingCollection(provider);
-  if (!col) return res.status(400).json({ error: "Proveedor inválido" });
-
-  const ids = Array.isArray(req.body?.ids) ? req.body.ids : [];
-  if (!ids.length) return res.json({ success: true, imported: 0, skipped: [], blocked: [] });
-
-  try {
-    const imported = [];
-    const blocked = [];
-    const skipped = [];
-
-    for (const rawId of ids) {
-      const id = String(rawId);
-      const ref = db.collection(col).doc(id);
-      const snap = await ref.get();
-      if (!snap.exists) {
-        skipped.push({ id, reason: "not_found" });
+        await docRef.set(blockedDoc, { merge: true });
+        console.warn(`⛔ BLOQUEADO: ${ref} (guardado como blocked=true)`);
         continue;
       }
 
-      const data = snap.data() || {};
-      if (isBlockedService(data)) {
-        blocked.push({ id, reason: "blocked_or_incomplete" });
-        continue;
-      }
+      const detalles = await page.evaluate(() => {
+        const d = {};
+        const filas = Array.from(document.querySelectorAll('tr'));
+        filas.forEach(tr => {
+          const celdas = tr.querySelectorAll('td');
+          if (celdas.length >= 2) {
+            const clave = celdas[0].innerText.toUpperCase().trim();
+            const valor = celdas[1].innerText.trim();
 
-      // Crear appointment
-      const appointmentDocId = crypto.randomUUID();
-      const now = new Date();
+            if (clave.includes("TELEFONOS")) {
+              const match = valor.match(/[6789]\d{8}/);
+              d.phone = match ? match[0] : valor;
+            }
+            if (clave.includes("CLIENTE")) d.clientName = valor;
+            if (clave.includes("DOMICILIO")) d.addressPart = valor;
+            if (clave.includes("POBLACION")) d.cityPart = valor;
+            if (clave.includes("ACTUALMENTE EN")) d.status_homeserve = valor;
+            if (clave.includes("COMPAÑIA")) d.company = valor;
+            if (clave.includes("FECHA ASIGNACION")) d.dateString = valor;
+            if (clave.includes("COMENTARIOS")) d.description = valor;
+          }
+        });
+        return d;
+      });
 
-      const appointment = {
-        id: appointmentDocId,
-        title: "Servicio (Proveedor)",
-        clientName: data.clientName || "",
-        address: data.address || "",
-        phone: data.phone || "",
-        isInsurance: true,
-        insuranceCompany: data.company || "",
-        serviceNumber: data.serviceNumber || id,
-        status: "pendingStart", // para que caiga en “Alta siniestros”
-        isUrgent: false,
-        notes: data.description || "",
-        clientNotes: "",
-        duration: 60,
-        date: admin.firestore.Timestamp.fromDate(now), // si prefieres null, dímelo y lo adaptamos
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        sourceProvider: provider,
-        sourcePendingId: id,
+      const fullAddress = `${detalles.addressPart || ""} ${detalles.cityPart || ""}`.trim();
+      let rawCompany = detalles.company || "";
+      if (!rawCompany.toUpperCase().includes("HOMESERVE")) rawCompany = `HOMESERVE - ${rawCompany}`;
+
+      const servicioFinal = {
+        serviceNumber: ref,
+        clientName: detalles.clientName || "Desconocido",
+        address: fullAddress,
+        phone: detalles.phone || "Sin teléfono",
+        description: detalles.description || "",
+        homeserveStatus: detalles.status_homeserve || "",
+        company: rawCompany,
+        dateString: detalles.dateString || "",
+        status: "pendiente_validacion",
+        blocked: false,
+        updatedAt: new Date().toISOString(),
       };
+      if (!datosAntiguos) servicioFinal.createdAt = new Date().toISOString();
 
-      await db.collection("appointments").doc(appointmentDocId).set(appointment);
+      if (!datosAntiguos) {
+        await docRef.set(servicioFinal);
+        console.log(`➕ NUEVO: ${ref} (Tlf: ${servicioFinal.phone})`);
+        nuevos++;
+      } else {
+        const cambioEstado = datosAntiguos.homeserveStatus !== servicioFinal.homeserveStatus;
+        const cambioTelefono = datosAntiguos.phone !== servicioFinal.phone;
+        const cambioBloqueo = !!datosAntiguos.blocked !== !!servicioFinal.blocked;
 
-      // Marcar el pendiente como importado (para que no se reimporte)
-      await ref.set(
-        {
-          status: "importado",
-          importedAt: admin.firestore.FieldValue.serverTimestamp(),
-          importedAppointmentDocId: appointmentDocId,
-        },
-        { merge: true }
-      );
-
-      imported.push({ id, appointmentDocId });
+        if (cambioEstado || cambioTelefono || cambioBloqueo) {
+          console.log(`♻️ ACTUALIZADO: ${ref}`);
+          await docRef.set(servicioFinal, { merge: true });
+          actualizados++;
+        }
+      }
     }
 
-    res.json({ success: true, imported: imported.length, importedItems: imported, blocked, skipped });
-  } catch (e) {
-    res.status(500).json({ error: "Error importando a appointments" });
+    console.log(`🏁 FIN V7.1: ${nuevos} nuevos, ${actualizados} actualizados.`);
+  } catch (error) {
+    console.error('❌ ERROR:', error.message);
+    process.exit(1);
+  } finally {
+    await browser.close();
+    process.exit(0);
   }
-});
+}
 
-// =====================
-// Start
-// =====================
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`✅ Server listening on :${PORT}`));
+runRobot();
