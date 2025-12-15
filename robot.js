@@ -2,6 +2,7 @@ const { chromium } = require('playwright');
 const admin = require('firebase-admin');
 
 
+
 // --- CONFIGURACIÓN FIREBASE (desde ENV de Render) ---
 if (process.env.FIREBASE_PRIVATE_KEY) {
   try {
