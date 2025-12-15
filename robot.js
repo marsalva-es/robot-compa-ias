@@ -25,6 +25,14 @@ const db = admin.firestore();
 const COLLECTION_NAME = "homeserve_pendientes";
 const PROVIDER_DOC = "homeserve"; // providerCredentials/homeserve
 
+// ✅ Colecciones donde comprobamos existencia. Si existe en CUALQUIERA → no guardamos.
+const EXISTENCE_CHECKS = [
+  { col: "appointments", field: "serviceNumber" }, // calendario
+  { col: "services", field: "serviceNumber" },     // alta cliente
+  { col: "homeserve_pendientes", field: "serviceNumber" }, // por si ya está en pendientes
+  // { col: "onlineAppointmentRequests", field: "serviceNumber" }, // opcional: si lo usas
+];
+
 async function getProviderCredentials(providerDocId) {
   const snap = await db.collection("providerCredentials").doc(providerDocId).get();
   if (!snap.exists) throw new Error(`No existe providerCredentials/${providerDocId} en Firestore`);
@@ -60,8 +68,39 @@ function hasMinimumData(detalles) {
   return phoneOk || hasClientAndAddress;
 }
 
+// -------------------------
+// ✅ Helpers existencia PRO
+// -------------------------
+function chunk(arr, size = 10) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
+async function preloadExistingServiceNumbers(serviceNumbers) {
+  const found = new Set();
+  const unique = Array.from(new Set(serviceNumbers)).filter(Boolean);
+  const parts = chunk(unique, 10);
+
+  for (const check of EXISTENCE_CHECKS) {
+    for (const p of parts) {
+      // Firestore "in" permite hasta 10 valores
+      const snap = await db.collection(check.col)
+        .where(check.field, "in", p)
+        .get();
+
+      snap.forEach(doc => {
+        const v = doc.get(check.field);
+        const normalized = normalizeServiceNumber(v);
+        if (normalized) found.add(normalized);
+      });
+    }
+  }
+  return found;
+}
+
 async function runRobot() {
-  console.log('🤖 [V7.2] Arrancando robot (NO guarda bloqueados / sin datos)...');
+  console.log('🤖 [V7.3] Arrancando robot (NO guarda bloqueados / sin datos / ni si ya existe en cualquier lado)...');
 
   // 0) Leer credenciales desde Firebase
   let creds;
@@ -124,14 +163,31 @@ async function runRobot() {
 
     console.log(`🔎 Encontrados ${referenciasEnWeb.length} servicios válidos.`);
 
+    // ✅ Normalizamos lista y precargamos existencia EN TODO EL SISTEMA
+    const referenciasNormalizadas = referenciasEnWeb
+      .map(normalizeServiceNumber)
+      .filter(Boolean);
+
+    console.log("🧠 Precargando existencia en Firestore (appointments/services/homeserve_pendientes)...");
+    const existentes = await preloadExistingServiceNumbers(referenciasNormalizadas);
+    console.log(`🧾 Ya existen en el sistema: ${existentes.size} (se saltarán)`);
+
     // --- PASO 3: PROCESAR UNO A UNO ---
     let actualizados = 0;
     let nuevos = 0;
     let saltadosBloqueo = 0;
+    let saltadosExistencia = 0;
 
     for (const ref of referenciasEnWeb) {
       const normalized = normalizeServiceNumber(ref);
       if (!normalized) continue;
+
+      // ✅ REGLA NUEVA: si ya existe en cualquier lado → NO GUARDAR NADA
+      if (existentes.has(normalized)) {
+        saltadosExistencia++;
+        console.log(`⏭️ SALTADO (ya existe en el sistema): ${normalized}`);
+        continue;
+      }
 
       // Navegar a la lista y hacer click
       await page.goto('https://www.clientes.homeserve.es/cgi-bin/fccgi.exe?w3exec=lista_servicios_total');
@@ -141,7 +197,7 @@ async function runRobot() {
         await page.click(`text="${normalized}"`, { timeout: 5000 });
         await page.waitForTimeout(1500);
       } catch (e) {
-        // ✅ REGLA NUEVA: si está bloqueado/no accesible → NO GUARDAR NADA
+        // ✅ REGLA: si está bloqueado/no accesible → NO GUARDAR NADA
         saltadosBloqueo++;
         console.warn(`⛔ SALTADO (bloqueado o no accesible): ${normalized}`);
         continue;
@@ -174,7 +230,7 @@ async function runRobot() {
         return d;
       });
 
-      // ✅ REGLA NUEVA: si entra pero no hay datos mínimos → NO GUARDAR
+      // ✅ REGLA: si entra pero no hay datos mínimos → NO GUARDAR
       if (!hasMinimumData(detalles)) {
         saltadosBloqueo++;
         console.warn(`⛔ SALTADO (sin datos mínimos): ${normalized}`);
@@ -225,7 +281,11 @@ async function runRobot() {
       }
     }
 
-    console.log(`🏁 FIN V7.2: ${nuevos} nuevos, ${actualizados} actualizados, ${saltadosBloqueo} saltados (bloqueados/sin datos).`);
+    console.log(
+      `🏁 FIN V7.3: ${nuevos} nuevos, ${actualizados} actualizados, ` +
+      `${saltadosBloqueo} saltados (bloqueados/sin datos), ` +
+      `${saltadosExistencia} saltados (ya existen en el sistema).`
+    );
 
   } catch (error) {
     console.error('❌ ERROR:', error.message);
