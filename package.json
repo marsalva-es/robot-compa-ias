@@ -1,12 +1,16 @@
 {
   "name": "marsalva-robot",
   "version": "1.0.0",
-  "main": "robot.js",
+  "main": "server.js",
+  "type": "commonjs",
   "scripts": {
-    "start": "node robot.js"
+    "start": "node server.js",
+    "robot": "node robot.js"
   },
   "dependencies": {
+    "express": "^4.19.2",
     "firebase-admin": "^12.0.0",
-    "playwright": "^1.49.0"
+    "playwright": "^1.49.0",
+    "cors": "^2.8.5"
   }
 }
