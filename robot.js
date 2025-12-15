@@ -32,13 +32,36 @@ async function getProviderCredentials(providerDocId) {
   const data = snap.data() || {};
   const user = String(data.user || "").trim();
   const pass = String(data.pass || "").trim();
-  if (!user || !pass) throw new Error(`providerCredentials/${providerDocId} no tiene user/pass completos`);
 
+  if (!user || !pass) throw new Error(`providerCredentials/${providerDocId} no tiene user/pass completos`);
   return { user, pass };
 }
 
+function normalizeServiceNumber(raw) {
+  const digits = String(raw || "").trim().replace(/\D/g, "");
+  // mínimo 4 dígitos para evitar basura tipo "SERVICIO"
+  if (!/^\d{4,}$/.test(digits)) return null;
+  return digits;
+}
+
+function hasMinimumData(detalles) {
+  const client = String(detalles.clientName || "").trim();
+  const addressPart = String(detalles.addressPart || "").trim();
+  const cityPart = String(detalles.cityPart || "").trim();
+  const phone = String(detalles.phone || "").trim();
+
+  const address = `${addressPart} ${cityPart}`.trim();
+
+  // ✅ Mínimos: (cliente + dirección) o teléfono válido.
+  // Ajusta si quieres ser más estricto.
+  const phoneOk = /^[6789]\d{8}$/.test(phone);
+  const hasClientAndAddress = client.length >= 3 && address.length >= 8;
+
+  return phoneOk || hasClientAndAddress;
+}
+
 async function runRobot() {
-  console.log('🤖 [V7.1] Arrancando robot (credenciales desde Firestore + filtro SERVICIO)...');
+  console.log('🤖 [V7.2] Arrancando robot (NO guarda bloqueados / sin datos)...');
 
   // 0) Leer credenciales desde Firebase
   let creds;
@@ -68,14 +91,15 @@ async function runRobot() {
     if (await page.isVisible(selectorUsuario)) {
       await page.fill(selectorUsuario, "");
       await page.fill(selectorPass, "");
-      await page.type(selectorUsuario, creds.user, { delay: 100 });
-      await page.type(selectorPass, creds.pass, { delay: 100 });
+
+      await page.type(selectorUsuario, creds.user, { delay: 80 });
+      await page.type(selectorPass, creds.pass, { delay: 80 });
 
       console.log('👆 Pulsando ENTER...');
       await page.keyboard.press('Enter');
       await page.waitForTimeout(5000);
     } else {
-      console.log("⚠️ No veo el formulario de login (puede que ya esté logueado o cambió la web).");
+      console.log("⚠️ No veo el formulario de login (puede que ya esté logueado).");
     }
 
     // --- PASO 2: OBTENER LISTA ---
@@ -90,13 +114,11 @@ async function runRobot() {
         const tds = tr.querySelectorAll('td');
         if (tds.length > 0) {
           const raw = (tds[0]?.innerText || "").trim();
-          // ✅ sacamos solo dígitos (si no hay dígitos, fuera → "SERVICIO" muere aquí)
           const digits = raw.replace(/\D/g, "");
           if (/^\d{4,}$/.test(digits)) refs.push(digits);
         }
       });
 
-      // quitar duplicados por si acaso
       return Array.from(new Set(refs));
     });
 
@@ -105,33 +127,27 @@ async function runRobot() {
     // --- PASO 3: PROCESAR UNO A UNO ---
     let actualizados = 0;
     let nuevos = 0;
+    let saltadosBloqueo = 0;
 
     for (const ref of referenciasEnWeb) {
-      const docRef = db.collection(COLLECTION_NAME).doc(ref);
-      const docSnapshot = await docRef.get();
-      const datosAntiguos = docSnapshot.exists ? docSnapshot.data() : null;
+      const normalized = normalizeServiceNumber(ref);
+      if (!normalized) continue;
 
       // Navegar a la lista y hacer click
       await page.goto('https://www.clientes.homeserve.es/cgi-bin/fccgi.exe?w3exec=lista_servicios_total');
+
       try {
-        await page.click(`text="${ref}"`);
+        // Si está bloqueado, aquí suele fallar el click o no navega/abre.
+        await page.click(`text="${normalized}"`, { timeout: 5000 });
         await page.waitForTimeout(1500);
       } catch (e) {
-        // ✅ si está bloqueado y no se puede entrar, lo marcamos bloqueado (para que NO se pueda dar de alta)
-        const blockedDoc = {
-          serviceNumber: ref,
-          blocked: true,
-          blockedReason: "No se pudo entrar en ficha (posible bloqueo de compañía)",
-          status: "blocked",
-          updatedAt: new Date().toISOString(),
-        };
-        if (!datosAntiguos) blockedDoc.createdAt = new Date().toISOString();
-
-        await docRef.set(blockedDoc, { merge: true });
-        console.warn(`⛔ BLOQUEADO: ${ref} (guardado como blocked=true)`);
+        // ✅ REGLA NUEVA: si está bloqueado/no accesible → NO GUARDAR NADA
+        saltadosBloqueo++;
+        console.warn(`⛔ SALTADO (bloqueado o no accesible): ${normalized}`);
         continue;
       }
 
+      // Scraping
       const detalles = await page.evaluate(() => {
         const d = {};
         const filas = Array.from(document.querySelectorAll('tr'));
@@ -143,8 +159,9 @@ async function runRobot() {
 
             if (clave.includes("TELEFONOS")) {
               const match = valor.match(/[6789]\d{8}/);
-              d.phone = match ? match[0] : valor;
+              d.phone = match ? match[0] : "";
             }
+
             if (clave.includes("CLIENTE")) d.clientName = valor;
             if (clave.includes("DOMICILIO")) d.addressPart = valor;
             if (clave.includes("POBLACION")) d.cityPart = valor;
@@ -157,43 +174,59 @@ async function runRobot() {
         return d;
       });
 
+      // ✅ REGLA NUEVA: si entra pero no hay datos mínimos → NO GUARDAR
+      if (!hasMinimumData(detalles)) {
+        saltadosBloqueo++;
+        console.warn(`⛔ SALTADO (sin datos mínimos): ${normalized}`);
+        continue;
+      }
+
       const fullAddress = `${detalles.addressPart || ""} ${detalles.cityPart || ""}`.trim();
+
       let rawCompany = detalles.company || "";
-      if (!rawCompany.toUpperCase().includes("HOMESERVE")) rawCompany = `HOMESERVE - ${rawCompany}`;
+      if (rawCompany && !rawCompany.toUpperCase().includes("HOMESERVE")) {
+        rawCompany = `HOMESERVE - ${rawCompany}`;
+      }
+
+      const docRef = db.collection(COLLECTION_NAME).doc(normalized);
+      const docSnapshot = await docRef.get();
+      const datosAntiguos = docSnapshot.exists ? docSnapshot.data() : null;
 
       const servicioFinal = {
-        serviceNumber: ref,
+        serviceNumber: normalized,
         clientName: detalles.clientName || "Desconocido",
         address: fullAddress,
         phone: detalles.phone || "Sin teléfono",
         description: detalles.description || "",
         homeserveStatus: detalles.status_homeserve || "",
-        company: rawCompany,
+        company: rawCompany || "",
         dateString: detalles.dateString || "",
         status: "pendiente_validacion",
-        blocked: false,
         updatedAt: new Date().toISOString(),
       };
+
       if (!datosAntiguos) servicioFinal.createdAt = new Date().toISOString();
 
       if (!datosAntiguos) {
         await docRef.set(servicioFinal);
-        console.log(`➕ NUEVO: ${ref} (Tlf: ${servicioFinal.phone})`);
+        console.log(`➕ NUEVO: ${normalized} (Tlf: ${servicioFinal.phone})`);
         nuevos++;
       } else {
-        const cambioEstado = datosAntiguos.homeserveStatus !== servicioFinal.homeserveStatus;
-        const cambioTelefono = datosAntiguos.phone !== servicioFinal.phone;
-        const cambioBloqueo = !!datosAntiguos.blocked !== !!servicioFinal.blocked;
+        const cambioEstado = (datosAntiguos.homeserveStatus || "") !== (servicioFinal.homeserveStatus || "");
+        const cambioTelefono = (datosAntiguos.phone || "") !== (servicioFinal.phone || "");
+        const cambioAddress = (datosAntiguos.address || "") !== (servicioFinal.address || "");
+        const cambioCliente = (datosAntiguos.clientName || "") !== (servicioFinal.clientName || "");
 
-        if (cambioEstado || cambioTelefono || cambioBloqueo) {
-          console.log(`♻️ ACTUALIZADO: ${ref}`);
+        if (cambioEstado || cambioTelefono || cambioAddress || cambioCliente) {
+          console.log(`♻️ ACTUALIZADO: ${normalized}`);
           await docRef.set(servicioFinal, { merge: true });
           actualizados++;
         }
       }
     }
 
-    console.log(`🏁 FIN V7.1: ${nuevos} nuevos, ${actualizados} actualizados.`);
+    console.log(`🏁 FIN V7.2: ${nuevos} nuevos, ${actualizados} actualizados, ${saltadosBloqueo} saltados (bloqueados/sin datos).`);
+
   } catch (error) {
     console.error('❌ ERROR:', error.message);
     process.exit(1);
