@@ -25,12 +25,10 @@ const db = admin.firestore();
 const COLLECTION_NAME = "homeserve_pendientes";
 const PROVIDER_DOC = "homeserve"; // providerCredentials/homeserve
 
-// ✅ Colecciones donde comprobamos existencia. Si existe en CUALQUIERA → no guardamos.
+// ✅ Si existe en cualquiera de estas colecciones, no se guarda como pendiente
 const EXISTENCE_CHECKS = [
-  { col: "appointments", field: "serviceNumber" }, // calendario
-  { col: "services", field: "serviceNumber" },     // alta cliente
-  { col: "homeserve_pendientes", field: "serviceNumber" }, // por si ya está en pendientes
-  // { col: "onlineAppointmentRequests", field: "serviceNumber" }, // opcional: si lo usas
+  { col: "appointments", field: "serviceNumber" },
+  { col: "services", field: "serviceNumber" },
 ];
 
 async function getProviderCredentials(providerDocId) {
@@ -47,7 +45,6 @@ async function getProviderCredentials(providerDocId) {
 
 function normalizeServiceNumber(raw) {
   const digits = String(raw || "").trim().replace(/\D/g, "");
-  // mínimo 4 dígitos para evitar basura tipo "SERVICIO"
   if (!/^\d{4,}$/.test(digits)) return null;
   return digits;
 }
@@ -60,17 +57,12 @@ function hasMinimumData(detalles) {
 
   const address = `${addressPart} ${cityPart}`.trim();
 
-  // ✅ Mínimos: (cliente + dirección) o teléfono válido.
-  // Ajusta si quieres ser más estricto.
   const phoneOk = /^[6789]\d{8}$/.test(phone);
   const hasClientAndAddress = client.length >= 3 && address.length >= 8;
 
   return phoneOk || hasClientAndAddress;
 }
 
-// -------------------------
-// ✅ Helpers existencia PRO
-// -------------------------
 function chunk(arr, size = 10) {
   const out = [];
   for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
@@ -84,7 +76,6 @@ async function preloadExistingServiceNumbers(serviceNumbers) {
 
   for (const check of EXISTENCE_CHECKS) {
     for (const p of parts) {
-      // Firestore "in" permite hasta 10 valores
       const snap = await db.collection(check.col)
         .where(check.field, "in", p)
         .get();
@@ -99,16 +90,21 @@ async function preloadExistingServiceNumbers(serviceNumbers) {
   return found;
 }
 
-async function runRobot() {
-  console.log('🤖 [V7.3] Arrancando robot (NO guarda bloqueados / sin datos / ni si ya existe en cualquier lado)...');
+async function getAllPendingDocIds() {
+  const snap = await db.collection(COLLECTION_NAME).get();
+  return snap.docs.map(d => d.id);
+}
 
-  // 0) Leer credenciales desde Firebase
+async function runRobot() {
+  console.log('🤖 [V7.4] Robot HomeServe (no dupes + archivado si desaparece)...');
+
+  // 0) Credenciales
   let creds;
   try {
     creds = await getProviderCredentials(PROVIDER_DOC);
-    console.log(`🔐 Credenciales cargadas OK: provider=${PROVIDER_DOC} user=${creds.user}`);
+    console.log(`🔐 Credenciales OK: provider=${PROVIDER_DOC} user=${creds.user}`);
   } catch (e) {
-    console.error("❌ No se pudieron cargar credenciales del proveedor:", e.message);
+    console.error("❌ No se pudieron cargar credenciales:", e.message);
     process.exit(1);
   }
 
@@ -119,8 +115,10 @@ async function runRobot() {
   const context = await browser.newContext();
   const page = await context.newPage();
 
+  const nowISO = new Date().toISOString();
+
   try {
-    // --- PASO 1: LOGIN ---
+    // LOGIN
     console.log('🔐 Entrando al login...');
     await page.goto('https://www.clientes.homeserve.es/cgi-bin/fccgi.exe?w3exec=PROF_PASS', { timeout: 60000 });
 
@@ -138,10 +136,10 @@ async function runRobot() {
       await page.keyboard.press('Enter');
       await page.waitForTimeout(5000);
     } else {
-      console.log("⚠️ No veo el formulario de login (puede que ya esté logueado).");
+      console.log("⚠️ No veo login (quizá ya logueado).");
     }
 
-    // --- PASO 2: OBTENER LISTA ---
+    // LISTA
     console.log('📂 Leyendo lista de servicios...');
     await page.goto('https://www.clientes.homeserve.es/cgi-bin/fccgi.exe?w3exec=lista_servicios_total');
 
@@ -163,47 +161,65 @@ async function runRobot() {
 
     console.log(`🔎 Encontrados ${referenciasEnWeb.length} servicios válidos.`);
 
-    // ✅ Normalizamos lista y precargamos existencia EN TODO EL SISTEMA
     const referenciasNormalizadas = referenciasEnWeb
       .map(normalizeServiceNumber)
       .filter(Boolean);
 
-    console.log("🧠 Precargando existencia en Firestore (appointments/services/homeserve_pendientes)...");
-    const existentes = await preloadExistingServiceNumbers(referenciasNormalizadas);
-    console.log(`🧾 Ya existen en el sistema: ${existentes.size} (se saltarán)`);
+    const webSet = new Set(referenciasNormalizadas);
 
-    // --- PASO 3: PROCESAR UNO A UNO ---
+    // ✅ precargar lo que ya existe en tu sistema (appointments/services)
+    console.log("🧠 Precargando existencia en Firestore (appointments/services)...");
+    const existentesSistema = await preloadExistingServiceNumbers(referenciasNormalizadas);
+    console.log(`🧾 Ya existen en el sistema: ${existentesSistema.size} (se saltarán como pendientes)`);
+
+    // ✅ archivo: ids que ya estaban en homeserve_pendientes
+    console.log("📦 Cargando documentos actuales de homeserve_pendientes para archivar lo que desaparezca...");
+    const pendingDocIds = await getAllPendingDocIds();
+    const pendingSet = new Set(pendingDocIds);
+
+    // --- PROCESAR ---
     let actualizados = 0;
     let nuevos = 0;
     let saltadosBloqueo = 0;
     let saltadosExistencia = 0;
+    let archivados = 0;
+    let archivadosPorIntegrado = 0;
 
     for (const ref of referenciasEnWeb) {
       const normalized = normalizeServiceNumber(ref);
       if (!normalized) continue;
 
-      // ✅ REGLA NUEVA: si ya existe en cualquier lado → NO GUARDAR NADA
-      if (existentes.has(normalized)) {
+      // ✅ si ya existe en tu sistema, no lo guardes como pendiente.
+      // Si estaba en pendientes, lo archivamos como "already_in_system"
+      if (existentesSistema.has(normalized)) {
         saltadosExistencia++;
+
+        if (pendingSet.has(normalized)) {
+          await db.collection(COLLECTION_NAME).doc(normalized).set({
+            status: "archived",
+            archivedReason: "already_in_system",
+            archivedAt: nowISO,
+            updatedAt: nowISO
+          }, { merge: true });
+          archivadosPorIntegrado++;
+        }
+
         console.log(`⏭️ SALTADO (ya existe en el sistema): ${normalized}`);
         continue;
       }
 
-      // Navegar a la lista y hacer click
+      // Navegar a la lista y click
       await page.goto('https://www.clientes.homeserve.es/cgi-bin/fccgi.exe?w3exec=lista_servicios_total');
 
       try {
-        // Si está bloqueado, aquí suele fallar el click o no navega/abre.
         await page.click(`text="${normalized}"`, { timeout: 5000 });
         await page.waitForTimeout(1500);
       } catch (e) {
-        // ✅ REGLA: si está bloqueado/no accesible → NO GUARDAR NADA
         saltadosBloqueo++;
-        console.warn(`⛔ SALTADO (bloqueado o no accesible): ${normalized}`);
+        console.warn(`⛔ SALTADO (bloqueado/no accesible): ${normalized}`);
         continue;
       }
 
-      // Scraping
       const detalles = await page.evaluate(() => {
         const d = {};
         const filas = Array.from(document.querySelectorAll('tr'));
@@ -230,7 +246,6 @@ async function runRobot() {
         return d;
       });
 
-      // ✅ REGLA: si entra pero no hay datos mínimos → NO GUARDAR
       if (!hasMinimumData(detalles)) {
         saltadosBloqueo++;
         console.warn(`⛔ SALTADO (sin datos mínimos): ${normalized}`);
@@ -257,11 +272,13 @@ async function runRobot() {
         homeserveStatus: detalles.status_homeserve || "",
         company: rawCompany || "",
         dateString: detalles.dateString || "",
+
         status: "pendiente_validacion",
-        updatedAt: new Date().toISOString(),
+        lastSeenAt: nowISO,
+        updatedAt: nowISO,
       };
 
-      if (!datosAntiguos) servicioFinal.createdAt = new Date().toISOString();
+      if (!datosAntiguos) servicioFinal.createdAt = nowISO;
 
       if (!datosAntiguos) {
         await docRef.set(servicioFinal);
@@ -272,19 +289,59 @@ async function runRobot() {
         const cambioTelefono = (datosAntiguos.phone || "") !== (servicioFinal.phone || "");
         const cambioAddress = (datosAntiguos.address || "") !== (servicioFinal.address || "");
         const cambioCliente = (datosAntiguos.clientName || "") !== (servicioFinal.clientName || "");
+        const cambioCompany = (datosAntiguos.company || "") !== (servicioFinal.company || "");
 
-        if (cambioEstado || cambioTelefono || cambioAddress || cambioCliente) {
+        if (cambioEstado || cambioTelefono || cambioAddress || cambioCliente || cambioCompany) {
           console.log(`♻️ ACTUALIZADO: ${normalized}`);
           await docRef.set(servicioFinal, { merge: true });
           actualizados++;
+        } else {
+          // aunque no cambie nada, actualizamos lastSeenAt/updatedAt
+          await docRef.set({ lastSeenAt: nowISO, updatedAt: nowISO }, { merge: true });
+        }
+
+        // Si estaba archivado por algo y reaparece, lo “desarchivamos”
+        if ((datosAntiguos.status || "") === "archived") {
+          await docRef.set({
+            status: "pendiente_validacion",
+            archivedAt: admin.firestore.FieldValue.delete(),
+            archivedReason: admin.firestore.FieldValue.delete(),
+            updatedAt: nowISO
+          }, { merge: true });
+        }
+      }
+    }
+
+    // ✅ Archivar lo que antes existía en Firestore pero ya no aparece en HomeServe
+    console.log("🗄️ Archivando los que han desaparecido de HomeServe...");
+    for (const docId of pendingDocIds) {
+      const sn = normalizeServiceNumber(docId);
+      if (!sn) continue;
+
+      // Si ya no aparece en la web, lo archivamos
+      if (!webSet.has(sn)) {
+        const ref = db.collection(COLLECTION_NAME).doc(sn);
+        const snap = await ref.get();
+        const data = snap.exists ? (snap.data() || {}) : {};
+
+        if ((data.status || "") !== "archived") {
+          await ref.set({
+            status: "archived",
+            archivedReason: "missing_from_homeserve",
+            archivedAt: nowISO,
+            updatedAt: nowISO
+          }, { merge: true });
+          archivados++;
         }
       }
     }
 
     console.log(
-      `🏁 FIN V7.3: ${nuevos} nuevos, ${actualizados} actualizados, ` +
+      `🏁 FIN V7.4: ${nuevos} nuevos, ${actualizados} actualizados, ` +
       `${saltadosBloqueo} saltados (bloqueados/sin datos), ` +
-      `${saltadosExistencia} saltados (ya existen en el sistema).`
+      `${saltadosExistencia} saltados (ya en sistema), ` +
+      `${archivados} archivados (desaparecidos), ` +
+      `${archivadosPorIntegrado} archivados (integrados).`
     );
 
   } catch (error) {
