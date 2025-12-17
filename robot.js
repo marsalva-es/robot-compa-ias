@@ -25,11 +25,10 @@ const db = admin.firestore();
 const COLLECTION_NAME = "homeserve_pendientes";
 const PROVIDER_DOC = "homeserve"; // providerCredentials/homeserve
 
-// ✅ Si existe en cualquiera de estas colecciones, no se guarda como pendiente
-const EXISTENCE_CHECKS = [
-  { col: "appointments", field: "serviceNumber" },
-  { col: "services", field: "serviceNumber" },
-];
+// Colecciones “sistema”
+const APPOINTMENTS_COL = "appointments";
+const SERVICES_COL = "services";
+const SERVICE_NUMBER_FIELD = "serviceNumber";
 
 async function getProviderCredentials(providerDocId) {
   const snap = await db.collection("providerCredentials").doc(providerDocId).get();
@@ -69,25 +68,55 @@ function chunk(arr, size = 10) {
   return out;
 }
 
-async function preloadExistingServiceNumbers(serviceNumbers) {
-  const found = new Set();
+function isCompletedStatus(raw) {
+  const s = String(raw || "").trim().toLowerCase();
+  return s === "completed" || s === "finalizado" || s === "finished" || s === "done";
+}
+
+async function preloadAppointmentsInfo(serviceNumbers) {
+  // Map(sn -> { status, isInboxPending })
+  const map = new Map();
   const unique = Array.from(new Set(serviceNumbers)).filter(Boolean);
   const parts = chunk(unique, 10);
 
-  for (const check of EXISTENCE_CHECKS) {
-    for (const p of parts) {
-      const snap = await db.collection(check.col)
-        .where(check.field, "in", p)
-        .get();
+  for (const p of parts) {
+    const snap = await db.collection(APPOINTMENTS_COL)
+      .where(SERVICE_NUMBER_FIELD, "in", p)
+      .get();
 
-      snap.forEach(doc => {
-        const v = doc.get(check.field);
-        const normalized = normalizeServiceNumber(v);
-        if (normalized) found.add(normalized);
+    snap.forEach(doc => {
+      const data = doc.data() || {};
+      const sn = normalizeServiceNumber(data[SERVICE_NUMBER_FIELD]);
+      if (!sn) return;
+      map.set(sn, {
+        status: String(data.status || "").trim(),
+        isInboxPending: !!data.isInboxPending,
+        docId: doc.id,
       });
-    }
+    });
   }
-  return found;
+
+  return map;
+}
+
+async function preloadServicesExistence(serviceNumbers) {
+  const set = new Set();
+  const unique = Array.from(new Set(serviceNumbers)).filter(Boolean);
+  const parts = chunk(unique, 10);
+
+  for (const p of parts) {
+    const snap = await db.collection(SERVICES_COL)
+      .where(SERVICE_NUMBER_FIELD, "in", p)
+      .get();
+
+    snap.forEach(doc => {
+      const data = doc.data() || {};
+      const sn = normalizeServiceNumber(data[SERVICE_NUMBER_FIELD]);
+      if (sn) set.add(sn);
+    });
+  }
+
+  return set;
 }
 
 async function getAllPendingDocIds() {
@@ -96,7 +125,7 @@ async function getAllPendingDocIds() {
 }
 
 async function runRobot() {
-  console.log('🤖 [V7.4] Robot HomeServe (no dupes + archivado si desaparece)...');
+  console.log('🤖 [V7.5] Robot HomeServe (no dupes + in_system + archiva solo completed)...');
 
   // 0) Credenciales
   let creds;
@@ -167,44 +196,83 @@ async function runRobot() {
 
     const webSet = new Set(referenciasNormalizadas);
 
-    // ✅ precargar lo que ya existe en tu sistema (appointments/services)
-    console.log("🧠 Precargando existencia en Firestore (appointments/services)...");
-    const existentesSistema = await preloadExistingServiceNumbers(referenciasNormalizadas);
-    console.log(`🧾 Ya existen en el sistema: ${existentesSistema.size} (se saltarán como pendientes)`);
+    // ✅ precargar info del sistema
+    console.log("🧠 Precargando datos del sistema (appointments/services)...");
+    const apptInfoMap = await preloadAppointmentsInfo(referenciasNormalizadas);
+    const servicesSet = await preloadServicesExistence(referenciasNormalizadas);
 
-    // ✅ archivo: ids que ya estaban en homeserve_pendientes
-    console.log("📦 Cargando documentos actuales de homeserve_pendientes para archivar lo que desaparezca...");
+    console.log(`🧾 En appointments: ${apptInfoMap.size} | En services: ${servicesSet.size}`);
+
+    // ✅ ids que ya estaban en homeserve_pendientes
+    console.log("📦 Cargando documentos actuales de homeserve_pendientes...");
     const pendingDocIds = await getAllPendingDocIds();
     const pendingSet = new Set(pendingDocIds);
 
-    // --- PROCESAR ---
+    // --- CONTADORES ---
     let actualizados = 0;
     let nuevos = 0;
     let saltadosBloqueo = 0;
-    let saltadosExistencia = 0;
-    let archivados = 0;
-    let archivadosPorIntegrado = 0;
+    let saltadosSinDatos = 0;
+
+    let marcadosInSystem = 0;
+    let archivadosCompleted = 0;
+    let marcadosMissingNoArchive = 0;
 
     for (const ref of referenciasEnWeb) {
       const normalized = normalizeServiceNumber(ref);
       if (!normalized) continue;
 
-      // ✅ si ya existe en tu sistema, no lo guardes como pendiente.
-      // Si estaba en pendientes, lo archivamos como "already_in_system"
-      if (existentesSistema.has(normalized)) {
-        saltadosExistencia++;
+      const appt = apptInfoMap.get(normalized);
+      const existsInAppointments = !!appt;
+      const existsInServices = servicesSet.has(normalized);
 
-        if (pendingSet.has(normalized)) {
-          await db.collection(COLLECTION_NAME).doc(normalized).set({
+      const existsInSystem = existsInAppointments || existsInServices;
+
+      // ✅ Si ya existe en sistema:
+      // - SI completed => archived
+      // - SI NO completed => in_system
+      // Y NO se archiva por “existir”, solo por completed.
+      if (existsInSystem && pendingSet.has(normalized)) {
+        const docRef = db.collection(COLLECTION_NAME).doc(normalized);
+
+        if (existsInAppointments && isCompletedStatus(appt.status)) {
+          await docRef.set({
             status: "archived",
-            archivedReason: "already_in_system",
+            archivedReason: "completed_in_system",
             archivedAt: nowISO,
-            updatedAt: nowISO
+            integratedIn: appt.isInboxPending ? "alta" : "calendar",
+            systemStatus: appt.status,
+            updatedAt: nowISO,
+            lastSeenAt: nowISO,
+            missingFromHomeServe: false
           }, { merge: true });
-          archivadosPorIntegrado++;
+
+          archivadosCompleted++;
+          console.log(`✅ ARCHIVED (completed): ${normalized}`);
+        } else {
+          await docRef.set({
+            status: "in_system",
+            integratedIn: existsInAppointments ? (appt.isInboxPending ? "alta" : "calendar") : "services",
+            systemStatus: existsInAppointments ? (appt.status || "") : "",
+            updatedAt: nowISO,
+            lastSeenAt: nowISO,
+            missingFromHomeServe: false
+          }, { merge: true });
+
+          marcadosInSystem++;
+          console.log(`🟧 IN_SYSTEM: ${normalized}`);
         }
 
-        console.log(`⏭️ SALTADO (ya existe en el sistema): ${normalized}`);
+        // No hace falta scrapear si ya existe el doc y ya está integrado
+        continue;
+      }
+
+      // Si existe en sistema pero NO existe en homeserve_pendientes (no lo tenías):
+      // lo tratamos como antes (scrape) y lo guardamos con status in_system (no archived).
+      // Si está completed, no creamos doc nuevo (no aporta mucho).
+      if (existsInSystem && !pendingSet.has(normalized) && existsInAppointments && isCompletedStatus(appt.status)) {
+        archivadosCompleted++;
+        console.log(`⏭️ SALTADO (completed y sin doc pendiente): ${normalized}`);
         continue;
       }
 
@@ -247,7 +315,7 @@ async function runRobot() {
       });
 
       if (!hasMinimumData(detalles)) {
-        saltadosBloqueo++;
+        saltadosSinDatos++;
         console.warn(`⛔ SALTADO (sin datos mínimos): ${normalized}`);
         continue;
       }
@@ -263,6 +331,21 @@ async function runRobot() {
       const docSnapshot = await docRef.get();
       const datosAntiguos = docSnapshot.exists ? docSnapshot.data() : null;
 
+      // Estado según sistema (si existe, es in_system; si no, pendiente_validacion)
+      let status = "pendiente_validacion";
+      let integratedIn = "";
+      let systemStatus = "";
+
+      if (existsInSystem) {
+        status = "in_system";
+        if (existsInAppointments) {
+          integratedIn = appt.isInboxPending ? "alta" : "calendar";
+          systemStatus = appt.status || "";
+        } else {
+          integratedIn = "services";
+        }
+      }
+
       const servicioFinal = {
         serviceNumber: normalized,
         clientName: detalles.clientName || "Desconocido",
@@ -273,16 +356,20 @@ async function runRobot() {
         company: rawCompany || "",
         dateString: detalles.dateString || "",
 
-        status: "pendiente_validacion",
+        status,
+        integratedIn,
+        systemStatus,
+
         lastSeenAt: nowISO,
         updatedAt: nowISO,
+        missingFromHomeServe: false,
       };
 
       if (!datosAntiguos) servicioFinal.createdAt = nowISO;
 
       if (!datosAntiguos) {
         await docRef.set(servicioFinal);
-        console.log(`➕ NUEVO: ${normalized} (Tlf: ${servicioFinal.phone})`);
+        console.log(`➕ NUEVO: ${normalized} (status=${status})`);
         nuevos++;
       } else {
         const cambioEstado = (datosAntiguos.homeserveStatus || "") !== (servicioFinal.homeserveStatus || "");
@@ -290,58 +377,99 @@ async function runRobot() {
         const cambioAddress = (datosAntiguos.address || "") !== (servicioFinal.address || "");
         const cambioCliente = (datosAntiguos.clientName || "") !== (servicioFinal.clientName || "");
         const cambioCompany = (datosAntiguos.company || "") !== (servicioFinal.company || "");
+        const cambioStatus = (datosAntiguos.status || "") !== (servicioFinal.status || "");
 
-        if (cambioEstado || cambioTelefono || cambioAddress || cambioCliente || cambioCompany) {
+        if (cambioEstado || cambioTelefono || cambioAddress || cambioCliente || cambioCompany || cambioStatus) {
           console.log(`♻️ ACTUALIZADO: ${normalized}`);
           await docRef.set(servicioFinal, { merge: true });
           actualizados++;
         } else {
-          // aunque no cambie nada, actualizamos lastSeenAt/updatedAt
-          await docRef.set({ lastSeenAt: nowISO, updatedAt: nowISO }, { merge: true });
+          await docRef.set({ lastSeenAt: nowISO, updatedAt: nowISO, missingFromHomeServe: false }, { merge: true });
         }
 
-        // Si estaba archivado por algo y reaparece, lo “desarchivamos”
+        // Si estaba archivado pero reaparece y NO está completed => lo “desarchivamos”
         if ((datosAntiguos.status || "") === "archived") {
-          await docRef.set({
-            status: "pendiente_validacion",
-            archivedAt: admin.firestore.FieldValue.delete(),
-            archivedReason: admin.firestore.FieldValue.delete(),
-            updatedAt: nowISO
-          }, { merge: true });
+          const shouldStayArchived = existsInAppointments && isCompletedStatus(appt?.status);
+          if (!shouldStayArchived) {
+            await docRef.set({
+              status: status,
+              archivedAt: admin.firestore.FieldValue.delete(),
+              archivedReason: admin.firestore.FieldValue.delete(),
+              updatedAt: nowISO
+            }, { merge: true });
+          }
         }
       }
     }
 
-    // ✅ Archivar lo que antes existía en Firestore pero ya no aparece en HomeServe
-    console.log("🗄️ Archivando los que han desaparecido de HomeServe...");
-    for (const docId of pendingDocIds) {
-      const sn = normalizeServiceNumber(docId);
-      if (!sn) continue;
+    // ✅ Gestionar lo que ha desaparecido de HomeServe
+    // Regla NUEVA: NO archivar por desaparecer; SOLO archivar si completed.
+    console.log("🗄️ Revisando los que han desaparecido de HomeServe (sin archivar salvo completed)...");
+    const missingIds = pendingDocIds
+      .map(normalizeServiceNumber)
+      .filter(Boolean)
+      .filter(sn => !webSet.has(sn));
 
-      // Si ya no aparece en la web, lo archivamos
-      if (!webSet.has(sn)) {
-        const ref = db.collection(COLLECTION_NAME).doc(sn);
-        const snap = await ref.get();
-        const data = snap.exists ? (snap.data() || {}) : {};
+    // precargamos su estado en sistema para decidir
+    const apptMissingMap = await preloadAppointmentsInfo(missingIds);
+    const servicesMissingSet = await preloadServicesExistence(missingIds);
 
+    for (const sn of missingIds) {
+      const ref = db.collection(COLLECTION_NAME).doc(sn);
+      const snap = await ref.get();
+      const data = snap.exists ? (snap.data() || {}) : {};
+
+      const appt = apptMissingMap.get(sn);
+      const existsInAppointments = !!appt;
+      const existsInServices = servicesMissingSet.has(sn);
+      const existsInSystem = existsInAppointments || existsInServices;
+
+      if (existsInAppointments && isCompletedStatus(appt.status)) {
+        // ✅ SOLO AQUÍ archivamos
         if ((data.status || "") !== "archived") {
           await ref.set({
             status: "archived",
-            archivedReason: "missing_from_homeserve",
+            archivedReason: "completed_in_system",
             archivedAt: nowISO,
-            updatedAt: nowISO
+            integratedIn: appt.isInboxPending ? "alta" : "calendar",
+            systemStatus: appt.status,
+            updatedAt: nowISO,
+            missingFromHomeServe: true,
+            missingAt: nowISO
           }, { merge: true });
-          archivados++;
+          archivadosCompleted++;
         }
+        continue;
       }
+
+      if (existsInSystem) {
+        // Está en tu sistema pero no está completed => en sistema, NO archived
+        await ref.set({
+          status: "in_system",
+          integratedIn: existsInAppointments ? (appt.isInboxPending ? "alta" : "calendar") : "services",
+          systemStatus: existsInAppointments ? (appt.status || "") : "",
+          updatedAt: nowISO,
+          missingFromHomeServe: true,
+          missingAt: nowISO
+        }, { merge: true });
+        marcadosInSystem++;
+        continue;
+      }
+
+      // No está en sistema y ha desaparecido de HomeServe -> NO archivar, solo marcar missing
+      await ref.set({
+        missingFromHomeServe: true,
+        missingAt: nowISO,
+        updatedAt: nowISO
+      }, { merge: true });
+      marcadosMissingNoArchive++;
     }
 
     console.log(
-      `🏁 FIN V7.4: ${nuevos} nuevos, ${actualizados} actualizados, ` +
-      `${saltadosBloqueo} saltados (bloqueados/sin datos), ` +
-      `${saltadosExistencia} saltados (ya en sistema), ` +
-      `${archivados} archivados (desaparecidos), ` +
-      `${archivadosPorIntegrado} archivados (integrados).`
+      `🏁 FIN V7.5: ${nuevos} nuevos, ${actualizados} actualizados, ` +
+      `${saltadosBloqueo} saltados (bloqueados), ${saltadosSinDatos} saltados (sin datos), ` +
+      `${marcadosInSystem} marcados in_system, ${archivadosCompleted} archivados (completed), ` +
+      `${marcadosMissingNoArchive} marcados missing (NO archived).`
     );
 
   } catch (error) {
